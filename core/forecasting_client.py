@@ -1,0 +1,722 @@
+"""
+Forecasting API client for guidry-cloud.com integration.
+"""
+import asyncio
+from typing import Dict, List, Optional, Any, Union
+from datetime import datetime, timedelta
+from time import perf_counter
+import httpx
+from httpx import TimeoutException
+from core.logging import log
+from core.mocks.mock_forecasting_service import get_mock_forecasting_service
+from core.telemetry.guidry_stats import guidry_cloud_stats
+
+
+class ForecastingAPIError(Exception):
+    """Base exception for forecasting API operations."""
+    pass
+
+
+class AssetNotEnabledError(ForecastingAPIError):
+    """Raised when the forecasting API reports that an asset is not enabled."""
+
+    def __init__(self, ticker: str, message: str):
+        self.ticker = ticker
+        super().__init__(message)
+
+
+class ForecastingClient:
+    """Client for interacting with the forecasting API at guidry-cloud.com."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.base_url = config.get("base_url", "https://forecasting.guidry-cloud.com")
+        self.api_key = config.get("api_key")
+        self.timeout = config.get("timeout", 30.0)
+        self.retry_attempts = config.get("retry_attempts", 3)
+        self.retry_delay = config.get("retry_delay", 1.0)
+        
+        # HTTP client
+        self.client: Optional[httpx.AsyncClient] = None
+        
+        # Cache for frequently accessed data
+        self.cache: Dict[str, Any] = {}
+        self.cache_ttl: Dict[str, datetime] = {}
+        self.default_cache_ttl = timedelta(minutes=5)
+        
+        # Mock mode (explicit flag preferred, falls back to legacy config flag)
+        mock_mode = config.get("mock_mode")
+        if mock_mode is None:
+            mock_mode = bool(config.get("use_mock_services", False))
+        self.is_mock = bool(mock_mode)
+        self.mock_data: Dict[str, Any] = {}
+        self.mock_service = None
+    
+    async def connect(self) -> None:
+        """Initialize the HTTP client."""
+        try:
+            if not self.is_mock and not self.api_key:
+                raise ForecastingAPIError(
+                    "Forecasting API key is required when mock_mode is disabled."
+                )
+
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "AgenticTradingSystem/1.0.0"
+            }
+            
+            if self.api_key:
+                headers["X-API-Key"] = self.api_key
+            
+            self.client = httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=headers,
+                timeout=self.timeout,
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+                verify=False  # Disable SSL verification for development/testing
+            )
+            
+            if self.is_mock:
+                self.mock_service = await get_mock_forecasting_service()
+                await self._setup_mock_data()
+            
+            log.info(f"Forecasting API client connected to {self.base_url}")     
+              
+        except Exception as e:
+            log.error(f"Failed to connect to forecasting API: {e}")
+            raise ForecastingAPIError(f"Connection failed: {e}")
+    
+    async def initialize(self) -> None:
+        """Initialize the forecasting client (alias for connect)."""
+        try:
+            await self.connect()        
+        except Exception as e:
+            log.error(f"Failed to connect to forecasting API: {e}")
+            raise ForecastingAPIError(f"Connection failed: {e}")
+    
+    async def disconnect(self) -> None:
+        """Close the HTTP client."""
+        if self.client:
+            await self.client.aclose()
+            self.client = None
+        log.info("Forecasting API client disconnected")
+    
+    async def _setup_mock_data(self) -> None:
+        """Setup mock data for testing."""
+        self.mock_data = {
+            "tickers": [
+                {"symbol": "BTC-USD", "name": "Bitcoin", "type": "crypto", "intervals": ["minutes", "hours", "days", "thirty"], "has_dqn": True},
+                {"symbol": "ETH-USD", "name": "Ethereum", "type": "crypto", "intervals": ["minutes", "hours", "days", "thirty"], "has_dqn": True},
+                {"symbol": "SOL-USD", "name": "Solana", "type": "crypto", "intervals": ["minutes", "hours", "days", "thirty"], "has_dqn": True},
+            ],
+            "actions": {
+                "BTC-USD": {"hours": {"action": 2, "action_confidence": 0.85, "forecast_price": 47000.0}, "days": {"action": 2, "action_confidence": 0.78, "forecast_price": 50000.0}},
+                "ETH-USD": {"hours": {"action": 1, "action_confidence": 0.72, "forecast_price": 2100.0}, "days": {"action": 2, "action_confidence": 0.81, "forecast_price": 2300.0}},
+                "SOL-USD": {"hours": {"action": 0, "action_confidence": 0.68, "forecast_price": 95.0}, "days": {"action": 1, "action_confidence": 0.75, "forecast_price": 100.0}},
+            },
+            "metrics": {
+                "BTC-USD": {"hours": {"accuracy": 0.82, "sharpe_ratio": 1.45, "max_drawdown": 0.12}, "days": {"accuracy": 0.78, "sharpe_ratio": 1.32, "max_drawdown": 0.15}},
+                "ETH-USD": {"hours": {"accuracy": 0.79, "sharpe_ratio": 1.28, "max_drawdown": 0.14}, "days": {"accuracy": 0.81, "sharpe_ratio": 1.41, "max_drawdown": 0.13}},
+                "SOL-USD": {"hours": {"accuracy": 0.75, "sharpe_ratio": 1.15, "max_drawdown": 0.18}, "days": {"accuracy": 0.77, "sharpe_ratio": 1.22, "max_drawdown": 0.16}},
+            }
+        }
+    
+    def _normalise_ohlc_entry(self, entry: Any) -> Optional[Dict[str, Any]]:
+        """Normalise a single OHLC candle from external API responses."""
+        if not isinstance(entry, dict):
+            return None
+
+        lowered = {str(key).lower(): value for key, value in entry.items()}
+
+        timestamp = None
+        for key, value in entry.items():
+            if str(key).lower() in {"timestamp", "time", "date"}:
+                timestamp = value
+                break
+        if not timestamp:
+            return None
+
+        def to_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        normalised = {
+            "timestamp": timestamp,
+            "open": to_float(lowered.get("open")),
+            "high": to_float(lowered.get("high")),
+            "low": to_float(lowered.get("low")),
+            "close": to_float(lowered.get("close")),
+            "volume": to_float(lowered.get("volume")) or 0.0,
+        }
+
+        if any(normalised.get(field) is None for field in ("open", "high", "low", "close")):
+            return None
+
+        return normalised
+
+    def _normalise_forecast_entry(self, ticker: str, interval: str, entry: Any) -> Optional[Dict[str, Any]]:
+        """Normalise forecast entries returned by the forecasting API."""
+        if not isinstance(entry, dict):
+            return None
+
+        lowered = {str(key).lower(): value for key, value in entry.items()}
+
+        timestamp = None
+        for key, value in entry.items():
+            if str(key).lower() in {"timestamp", "time", "date"}:
+                timestamp = value
+                break
+        prediction_time = entry.get("pred_date") or entry.get("prediction_time")
+
+        def to_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        forecast_value = to_float(
+            lowered.get("forecasting")
+            or lowered.get("forecast")
+            or lowered.get("prediction")
+        )
+        close_value = to_float(lowered.get("close"))
+
+        if not timestamp and not prediction_time:
+            return None
+
+        normalised = {
+            "ticker": ticker,
+            "interval": interval,
+            "timestamp": timestamp,
+            "prediction_time": prediction_time,
+            "forecast": forecast_value,
+            "price": forecast_value,
+            "close": close_value,
+        }
+
+        # Preserve any additional attributes for transparency/debugging.
+        for key, value in entry.items():
+            if key not in normalised:
+                normalised[key] = value
+
+        return normalised
+
+    async def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Make HTTP request with retry logic."""
+        if not self.client:
+            raise ForecastingAPIError("Not connected to forecasting API")
+        
+        for attempt in range(self.retry_attempts):
+            try:
+                start = perf_counter()
+                if method == "GET":
+                    response = await self.client.get(endpoint, params=params)
+                elif method == "POST":
+                    response = await self.client.post(endpoint, params=params, json=data)
+                else:
+                    raise ForecastingAPIError(f"Unsupported HTTP method: {method}")
+                
+                response.raise_for_status()
+                duration = perf_counter() - start
+                guidry_cloud_stats.record_success(endpoint, response.status_code, duration)
+                return response.json()
+                
+            except httpx.HTTPStatusError as e:
+                duration = perf_counter() - start
+                status_code = e.response.status_code
+                detail = self._extract_error_detail(e)
+                ticker = self._extract_ticker_from_endpoint(endpoint, params, data)
+                guidry_cloud_stats.record_failure(
+                    endpoint=endpoint,
+                    status=status_code,
+                    duration_secs=duration,
+                    error=detail,
+                    rate_limited=status_code == 429,
+                    disabled_asset=ticker if detail and "not enabled" in detail.lower() else None,
+                )
+                if e.response.status_code == 400:
+                    if detail and "not enabled" in detail.lower():
+                        raise AssetNotEnabledError(ticker or "UNKNOWN", detail)
+                if status_code in [429, 502, 503, 504] and attempt < self.retry_attempts - 1:
+                    # Retry on rate limit or server errors
+                    await asyncio.sleep(self.retry_delay * (2 ** attempt))
+                    continue
+                raise ForecastingAPIError(f"HTTP error {status_code}: {e.response.text}")
+            except Exception as e:
+                duration = perf_counter() - start
+                guidry_cloud_stats.record_failure(
+                    endpoint=endpoint,
+                    status=0,
+                    duration_secs=duration,
+                    error=str(e),
+                    timeout=isinstance(e, TimeoutException),
+                )
+                if attempt < self.retry_attempts - 1:
+                    await asyncio.sleep(self.retry_delay * (2 ** attempt))
+                    continue
+                raise ForecastingAPIError(f"Request failed: {e}")
+        
+        raise ForecastingAPIError("Max retry attempts exceeded")
+
+    @staticmethod
+    def _extract_error_detail(error: httpx.HTTPStatusError) -> Optional[str]:
+        try:
+            payload = error.response.json()
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            for key in ("detail", "message", "error"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    return value
+                if isinstance(value, dict):
+                    nested_detail = value.get("detail") or value.get("message")
+                    if isinstance(nested_detail, str):
+                        return nested_detail
+        elif isinstance(payload, str):
+            return payload
+
+        text = error.response.text
+        return text if text else None
+
+    @staticmethod
+    def _extract_ticker_from_endpoint(
+        endpoint: str,
+        params: Optional[Dict[str, Any]],
+        data: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Best-effort attempt to recover the ticker from the request context."""
+
+        # Direct parameter overrides
+        for source in (params, data):
+            if isinstance(source, dict):
+                ticker = source.get("ticker") or source.get("symbol")
+                if isinstance(ticker, str):
+                    return ticker
+
+        # Endpoints of the form /api/json/action/<symbol>/<interval>
+        parts = endpoint.strip("/").split("/")
+        if len(parts) >= 4 and parts[-3] == "action":
+            return parts[-2]
+        if len(parts) >= 3 and parts[-2] in {"info", "metrics", "ohlc"}:
+            return parts[-1]
+
+        return None
+
+    def get_stats_snapshot(self) -> Dict[str, Any]:
+        """Return current aggregated statistics for Guidry Cloud API usage."""
+        return guidry_cloud_stats.summary()
+    
+    def _get_cached(self, key: str) -> Optional[Any]:
+        """Get cached data if not expired."""
+        if key in self.cache and key in self.cache_ttl:
+            if datetime.utcnow() < self.cache_ttl[key]:
+                return self.cache[key]
+            else:
+                # Remove expired cache
+                del self.cache[key]
+                del self.cache_ttl[key]
+        return None
+    
+    def _set_cache(self, key: str, value: Any, ttl: Optional[timedelta] = None) -> None:
+        """Set cached data with TTL."""
+        self.cache[key] = value
+        self.cache_ttl[key] = datetime.utcnow() + (ttl or self.default_cache_ttl)
+    
+    async def get_available_tickers(self) -> List[Dict[str, Any]]:
+        """Get list of available tickers."""
+        cache_key = "available_tickers"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            if self.mock_service:
+                # Use comprehensive mock service
+                tickers = await self.mock_service.get_available_tickers()
+                result = [{"symbol": ticker, "name": ticker.replace("-", " "), "active": True} for ticker in tickers]
+            else:
+                result = self.mock_data["tickers"]
+        else:
+            try:
+                response = await self._make_request("GET", "/api/tickers/available")
+                if isinstance(response, list):
+                    result = response
+                else:
+                    result = response.get("tickers", [])
+            except Exception as e:
+                log.error(f"Failed to get available tickers: {e}")
+                return []
+        
+        self._set_cache(cache_key, result)
+        return result
+
+    async def get_enabled_assets(self) -> List[str]:
+        """Retrieve the list of assets currently enabled for trading."""
+        cache_key = "enabled_assets"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+
+        if self.is_mock:
+            assets = [ticker.replace("-USD", "") for ticker in self.mock_data.get("tickers", [])]
+        else:
+            try:
+                response = await self._make_request("GET", "/attribute/enabled-assets")
+                if isinstance(response, dict):
+                    assets = response.get("assets", [])
+                else:
+                    assets = response
+            except Exception as e:
+                log.error(f"Failed to fetch enabled assets: {e}")
+                return []
+
+        self._set_cache(cache_key, assets, timedelta(minutes=10))
+        return assets
+    
+    async def get_ticker_info(self, ticker: str) -> Dict[str, Any]:
+        """Get detailed information about a specific ticker."""
+        cache_key = f"ticker_info_{ticker}"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            # Find ticker in mock data
+            ticker_data = next((t for t in self.mock_data["tickers"] if t["symbol"] == ticker), None)
+            if not ticker_data:
+                raise ForecastingAPIError(f"Ticker {ticker} not found")
+            result = ticker_data
+        else:
+            try:
+                response = await self._make_request("GET", f"/api/tickers/{ticker}/info")
+                result = response
+            except Exception as e:
+                log.error(f"Failed to get ticker info for {ticker}: {e}")
+                raise ForecastingAPIError(f"Failed to get ticker info: {e}")
+        
+        self._set_cache(cache_key, result, timedelta(hours=1))  # Cache for 1 hour
+        return result
+    
+    async def get_action_recommendation(self, ticker: str, interval: str) -> Dict[str, Any]:
+        """Get DQN action recommendation for a ticker and interval."""
+        cache_key = f"action_{ticker}_{interval}"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            if self.mock_service:
+                # Use comprehensive mock service
+                mock_result = await self.mock_service.get_action_recommendation(ticker, interval)
+                result = {
+                    "action": 0 if mock_result["recommendation"] == "SELL" else 1 if mock_result["recommendation"] == "HOLD" else 2,
+                    "action_confidence": mock_result["confidence"],
+                    "forecast_price": mock_result.get("price_target", 100.0),
+                    "q_values": [0.3, 0.5, 0.2],  # [SELL, HOLD, BUY]
+                    "current_price": 100.0,
+                    "recommendation": mock_result["recommendation"],
+                    "reasoning": mock_result["reasoning"]
+                }
+            elif ticker in self.mock_data["actions"] and interval in self.mock_data["actions"][ticker]:
+                result = self.mock_data["actions"][ticker][interval]
+            else:
+                # Default mock response
+                result = {
+                    "action": 1,  # HOLD
+                    "action_confidence": 0.5,
+                    "forecast_price": 100.0,
+                    "q_values": [0.3, 0.5, 0.2],  # [SELL, HOLD, BUY]
+                    "current_price": 100.0
+                }
+        else:
+            try:
+                response = await self._make_request("GET", f"/api/json/action/{ticker}/{interval}")
+                if isinstance(response, dict) and "forecast" in response and "forecast_price" not in response:
+                    response = {**response, "forecast_price": response.get("forecast")}
+                result = response
+            except AssetNotEnabledError:
+                raise
+            except Exception as e:
+                log.error(f"Failed to get action recommendation for {ticker}/{interval}: {e}")
+                raise ForecastingAPIError(f"Failed to get action recommendation: {e}")
+        
+        self._set_cache(cache_key, result, timedelta(minutes=2))  # Cache for 2 minutes
+        return result
+    
+    async def get_stock_forecast(self, ticker: str, interval: str) -> Dict[str, Any]:
+        """Get detailed stock forecast data."""
+        cache_key = f"forecast_{ticker}_{interval}"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            if self.mock_service:
+                # Use comprehensive mock service
+                mock_result = await self.mock_service.get_stock_forecast(ticker, interval)
+                result = {
+                    "ticker": ticker,
+                    "interval": interval,
+                    "forecast_price": mock_result["forecast"][0]["price"] if mock_result["forecast"] else 100.0,
+                    "confidence": mock_result["forecast"][0]["confidence"] if mock_result["forecast"] else 0.75,
+                    "trend": mock_result["forecast"][0]["trend"] if mock_result["forecast"] else "bullish",
+                    "support_levels": [95.0, 90.0],
+                    "resistance_levels": [105.0, 110.0],
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "forecast_data": mock_result["forecast"],
+                    "model_version": mock_result.get("model_version", "v1.0.0")
+                }
+            else:
+                # Generate mock forecast data
+                result = {
+                    "ticker": ticker,
+                    "interval": interval,
+                    "forecast_price": 100.0,
+                    "confidence": 0.75,
+                    "trend": "bullish",
+                    "support_levels": [95.0, 90.0],
+                    "resistance_levels": [105.0, 110.0],
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+        else:
+            try:
+                response = await self._make_request("GET", f"/api/json/stock/{interval}/{ticker}")
+                if isinstance(response, list):
+                    normalised = [
+                        record
+                        for record in (
+                            self._normalise_forecast_entry(ticker, interval, item)
+                            for item in response
+                        )
+                        if record
+                    ]
+                    forecast_price = None
+                    for record in reversed(normalised):
+                        if record.get("forecast") is not None:
+                            forecast_price = record["forecast"]
+                            break
+
+                    result = {
+                        "ticker": ticker,
+                        "interval": interval,
+                        "forecast_price": forecast_price,
+                        "forecast_data": normalised,
+                    }
+                elif isinstance(response, dict):
+                    if "forecast_price" not in response:
+                        forecast_val = response.get("forecast") or response.get("forecasting")
+                        if forecast_val is not None:
+                            try:
+                                forecast_val = float(forecast_val)
+                            except (TypeError, ValueError):
+                                forecast_val = None
+                        response = {**response, "forecast_price": forecast_val}
+                    result = response
+                else:
+                    result = {
+                        "ticker": ticker,
+                        "interval": interval,
+                        "forecast_price": None,
+                        "forecast_data": [],
+                    }
+            except Exception as e:
+                log.error(f"Failed to get stock forecast for {ticker}/{interval}: {e}")
+                raise ForecastingAPIError(f"Failed to get stock forecast: {e}")
+        
+        self._set_cache(cache_key, result, timedelta(minutes=5))  # Cache for 5 minutes
+        return result
+    
+    async def get_model_metrics(self, ticker: str, interval: str) -> Dict[str, Any]:
+        """Get model performance metrics."""
+        cache_key = f"metrics_{ticker}_{interval}"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            if ticker in self.mock_data["metrics"] and interval in self.mock_data["metrics"][ticker]:
+                result = self.mock_data["metrics"][ticker][interval]
+            else:
+                # Default mock metrics
+                result = {
+                    "accuracy": 0.75,
+                    "sharpe_ratio": 1.2,
+                    "max_drawdown": 0.15,
+                    "win_rate": 0.65,
+                    "total_trades": 100,
+                    "avg_return": 0.02
+                }
+        else:
+            try:
+                response = await self._make_request("GET", f"/api/json/metrics/{ticker}/{interval}")
+                result = response
+            except Exception as e:
+                log.error(f"Failed to get model metrics for {ticker}/{interval}: {e}")
+                raise ForecastingAPIError(f"Failed to get model metrics: {e}")
+        
+        self._set_cache(cache_key, result, timedelta(hours=1))  # Cache for 1 hour
+        return result
+    
+    async def get_ohlc(self, ticker: str, interval: str, limit: int = 120) -> List[Dict[str, Any]]:
+        """Fetch OHLC candles for a ticker/interval."""
+        cache_key = f"ohlc_{ticker}_{interval}_{limit}"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+
+        if self.is_mock:
+            if self.mock_service:
+                candles = await self.mock_service.get_ohlc(ticker, interval, limit=limit)
+            else:
+                candles = [
+                    {
+                        "timestamp": (datetime.utcnow() - timedelta(minutes=limit - i)).isoformat(),
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.5,
+                        "close": 100.5,
+                        "volume": 1_000_000,
+                    }
+                    for i in range(limit)
+                ]
+        else:
+            params = {"limit": limit}
+            try:
+                response = await self._make_request("GET", f"/api/json/ohlc/{interval}/{ticker}", params=params)
+                if isinstance(response, dict):
+                    candles = response.get("ohlc", [])
+                elif isinstance(response, list):
+                    candles = response
+                else:
+                    candles = []
+            except Exception as e:
+                log.error("Failed to fetch OHLC for {}/{}: {}", ticker, interval, e)
+                raise ForecastingAPIError(f"Failed to fetch OHLC data: {e}")
+
+        normalised = [
+            record
+            for record in (self._normalise_ohlc_entry(item) for item in candles)
+            if record
+        ]
+
+        if not normalised:
+            log.debug(
+                "Unable to normalise OHLC data for %s/%s (received %d raw items)",
+                ticker,
+                interval,
+                len(candles),
+            )
+
+        self._set_cache(cache_key, normalised, timedelta(minutes=2))
+        return normalised
+    
+    async def get_available_intervals(self) -> List[str]:
+        """Get list of available intervals."""
+        cache_key = "available_intervals"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            result = ["minutes", "hours", "days", "thirty"]
+        else:
+            try:
+                response = await self._make_request("GET", "/api/tickers/intervals")
+                result = response.get("intervals", [])
+            except Exception as e:
+                log.error(f"Failed to get available intervals: {e}")
+                return ["minutes", "hours", "days", "thirty"]  # Fallback
+        
+        self._set_cache(cache_key, result, timedelta(hours=24))  # Cache for 24 hours
+        return result
+    
+    async def get_market_sentiment(self) -> Dict[str, Any]:
+        """Get overall market sentiment."""
+        cache_key = "market_sentiment"
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+        
+        if self.is_mock:
+            result = {
+                "overall_sentiment": "bullish",
+                "sentiment_score": 0.65,
+                "fear_greed_index": 72,
+                "market_trend": "upward",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        else:
+            try:
+                response = await self._make_request("GET", "/api/news/market-sentiment")
+                result = response
+            except Exception as e:
+                log.error(f"Failed to get market sentiment: {e}")
+                # Return neutral sentiment as fallback
+                result = {
+                    "overall_sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "fear_greed_index": 50,
+                    "market_trend": "sideways",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+        
+        self._set_cache(cache_key, result, timedelta(minutes=15))  # Cache for 15 minutes
+        return result
+    
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Get API health status."""
+        try:
+            if self.is_mock:
+                return {
+                    "status": "healthy",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "version": "1.0.0",
+                    "uptime": "99.9%"
+                }
+            
+            response = await self._make_request("GET", "/health")
+            return response
+            
+        except Exception as e:
+            log.error(f"Failed to get health status: {e}")
+            return {
+                "status": "unhealthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "error": str(e)
+            }
+    
+    def clear_cache(self) -> None:
+        """Clear all cached data."""
+        self.cache.clear()
+        self.cache_ttl.clear()
+        log.info("Forecasting API cache cleared")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        return {
+            "cache_size": len(self.cache),
+            "cached_keys": list(self.cache.keys()),
+            "cache_ttl_entries": len(self.cache_ttl)
+        }
+
+
+# Global forecasting client instance
+from core.config import settings
+
+forecasting_client = ForecastingClient({
+    "base_url": settings.mcp_api_url,
+    "api_key": settings.mcp_api_key,
+    "mock_mode": settings.use_mock_services,
+    "timeout": 30.0,
+    "retry_attempts": 3,
+    "retry_delay": 1.0
+})
