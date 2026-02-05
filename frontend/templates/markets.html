@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h3>Market Search</h3>
+  <div class="input-row">
+    <input id="market-query" placeholder="Search Polymarket markets (e.g., bitcoin, election)" />
+    <button onclick="window.ui.loadMarkets()" class="btn-primary">Search</button>
+  </div>
+  <div style="margin-top: 12px; font-size: 0.85rem; color: var(--muted);">
+    Popular searches: <span onclick="document.getElementById('market-query').value='bitcoin'; window.ui.loadMarkets();" style="cursor: pointer; color: var(--accent);">bitcoin</span>, 
+    <span onclick="document.getElementById('market-query').value='election'; window.ui.loadMarkets();" style="cursor: pointer; color: var(--accent);">election</span>, 
+    <span onclick="document.getElementById('market-query').value='weather'; window.ui.loadMarkets();" style="cursor: pointer; color: var(--accent);">weather</span>
+  </div>
+  <table class="table" style="margin-top: 16px;">
+    <thead>
+      <tr>
+        <th>Market ID</th>
+        <th>Title</th>
+        <th>Liquidity</th>
+        <th>Volume 24h</th>
+      </tr>
+    </thead>
+    <tbody id="market-results"></tbody>
+  </table>
+  <div id="market-results-empty" class="empty" style="display: none; margin-top: 12px;">No markets found. Try a different search term.</div>
+</section>
+
+<style>
+  input[type="text"] {
+    width: 100%;
+  }
+</style>
+{% endblock %}
+{% block scripts %}
+<script>
+  // Allow search on Enter key
+  document.getElementById('market-query').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') window.ui.loadMarkets();
+  });
+</script>
+{% endblock %}
+

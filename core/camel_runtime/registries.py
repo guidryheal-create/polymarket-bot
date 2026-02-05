@@ -11,20 +11,34 @@ sources, etc.).
 from __future__ import annotations
 
 import asyncio
+import os
 from functools import partial
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from camel.toolkits import FunctionTool
 
 from core.config import settings
-from core.forecasting_client import ForecastingClient
-from core.dex_simulator_client import DEXSimulatorClient
+from core.clients.forecasting_client import ForecastingClient
+from core.clients.dex_simulator_client import DEXSimulatorClient
 from core.logging import log
 from core import asset_registry
 from core.telemetry.guidry_stats import guidry_cloud_stats
 from core.camel_tools.market_data_toolkit import MarketDataToolkit
-from core.camel_tools.mcp_forecasting_toolkit import MCPForecastingToolkit
+from core.camel_tools.api_forecasting_toolkit import APIForecastingToolkit
 from core.camel_tools.review_pipeline_toolkit import ReviewPipelineToolkit
+from core.camel_tools.signal_logging_toolkit import SignalLoggingToolkit
+from core.camel_tools.search_toolkit import SearchToolkit
+from core.camel_tools.polymarket_toolkit import EnhancedPolymarketToolkit
+from core.camel_tools.polymarket_data_toolkit import PolymarketDataToolkit
+from core.camel_runtime.utils import (
+    ToolValidation,
+    ClientInitialization,
+    LoggingMarkers,
+    ToolkitInitialization,
+)
+
+# ✅ Removed: conversation_logging_toolkit - no longer needed for RSS flux trading
+# ✅ Removed: wallet_distribution_toolkit - deprecated, use Polymarket positions instead
 
 try:
     from core.camel_tools.asknews_toolkit import AskNewsToolkit
@@ -35,6 +49,13 @@ try:
     from core.camel_tools.google_research_toolkit import GoogleResearchToolkit
 except ImportError:  # pragma: no cover - optional dependency
     GoogleResearchToolkit = None  # type: ignore
+
+try:
+    from core.camel_tools.yahoo_finance_toolkit import get_yahoo_finance_toolkit
+except ImportError:  # pragma: no cover - optional dependency
+    get_yahoo_finance_toolkit = None  # type: ignore
+
+# ✅ YouTube Transcript toolkit disabled - not needed for trading
 
 
 AsyncFn = Callable[..., Awaitable[Any]]
@@ -57,28 +78,75 @@ class ToolkitRegistry:
         self._dex_client: Optional[DEXSimulatorClient] = None
         self._tool_cache: Dict[str, FunctionTool] = {}
         self._lock = asyncio.Lock()
+        self._api_toolkit: Optional[APIForecastingToolkit] = None
         self._asknews_toolkit: Optional[AskNewsToolkit] = None
         self._search_toolkit: Optional[GoogleResearchToolkit] = None
         self._review_toolkit: Optional[ReviewPipelineToolkit] = None
+        self._signal_logging_toolkit: Optional[SignalLoggingToolkit] = None
+        self._polymarket_toolkit: Optional[EnhancedPolymarketToolkit] = None
+        self._polymarket_data_toolkit: Optional[PolymarketDataToolkit] = None
+        self._search_toolkit_new: Optional[SearchToolkit] = None
+        self._yahoo_finance_toolkit = None
+        LoggingMarkers.info(LoggingMarkers.TOOLKIT_REGISTRY, "Initialized (removed conversation_logging, wallet_distribution)")
+
+    def _is_forecasting_enabled(self) -> bool:
+        """Return True if forecasting tools should be loaded."""
+        return ClientInitialization.is_forecasting_enabled()
 
     async def ensure_clients(self) -> None:
         """Initialise shared service clients once."""
         async with self._lock:
-            if self._forecasting_client is None:
+            # Forecasting: skip entirely when FORECASTING_MODE=disabled (standalone Polymarket)
+            if self._is_forecasting_enabled() and self._forecasting_client is None:
+                use_mock = getattr(settings, "forecasting_mode", "api") == "mock"
                 self._forecasting_client = ForecastingClient(
                     {
                         "base_url": settings.mcp_api_url,
                         "api_key": settings.mcp_api_key,
-                        "mock_mode": settings.use_mock_services,
+                        "mock_mode": use_mock,
                     }
                 )
-                await self._forecasting_client.connect()
-                log.info("Toolkit registry connected Forecasting MCP client")
+                try:
+                    await self._forecasting_client.connect()
+                    log.info("Toolkit registry connected Forecasting MCP client")
+                except Exception as exc:
+                    log.warning(
+                        "Forecasting client connect failed: %s (forecasting tools disabled)",
+                        exc,
+                        exc_info=True,
+                    )
+                    self._forecasting_client = None
 
-            if self._dex_client is None:
-                self._dex_client = DEXSimulatorClient()
-                await self._dex_client.connect()
-                log.info("Toolkit registry connected DEX simulator client")
+                if self._forecasting_client:
+                    try:
+                        self._api_toolkit = APIForecastingToolkit(self._forecasting_client)
+                        await self._api_toolkit.initialize()
+                        log.info("Toolkit registry prepared API Forecasting toolkit")
+                    except Exception as exc:
+                        log.error(
+                            "API Forecasting toolkit initialization failed: %s",
+                            exc,
+                            exc_info=True,
+                        )
+                        self._api_toolkit = None
+            elif not self._is_forecasting_enabled():
+                log.info(
+                    "Forecasting disabled (FORECASTING_MODE=disabled), skipping forecasting tools"
+                )
+
+            # ✅ DEX simulator is optional and can cause instability if not configured.
+            # It is disabled by default and can be enabled via ENABLE_DEX_TOOLS=1|true|yes|on.
+            enable_dex = ClientInitialization.is_dex_enabled()
+            if enable_dex and self._dex_client is None:
+                try:
+                    self._dex_client = DEXSimulatorClient()
+                    await self._dex_client.connect()
+                    log.info("Toolkit registry connected DEX simulator client")
+                except Exception as exc:
+                    log.warning("DEX simulator initialisation failed: %s (DEX tools will be disabled)", exc, exc_info=True)
+                    self._dex_client = None
+            elif not enable_dex:
+                log.info("DEX simulator client disabled via ENABLE_DEX_TOOLS env (skipping DEX tools)")
 
             if self._asknews_toolkit is None and AskNewsToolkit is not None:
                 try:
@@ -89,14 +157,10 @@ class ToolkitRegistry:
                     log.debug("AskNews toolkit initialisation failed: %s", exc)
                     self._asknews_toolkit = None
 
-            if self._search_toolkit is None and GoogleResearchToolkit is not None:
-                try:
-                    self._search_toolkit = GoogleResearchToolkit()
-                    await self._search_toolkit.initialize()
-                    log.info("Toolkit registry prepared Google research toolkit")
-                except Exception as exc:
-                    log.debug("Google research toolkit initialisation failed: %s", exc)
-                    self._search_toolkit = None
+            # ✅ COMPLETELY DISABLED: Google Research Toolkit - not needed, has wrong tools
+            # User explicitly requested complete removal - Google toolkit is not useful for trading
+            self._search_toolkit = None
+            LoggingMarkers.info(LoggingMarkers.TOOLKIT_REGISTRY, "✅ Google Research Toolkit COMPLETELY DISABLED")
 
             if self._review_toolkit is None:
                 try:
@@ -107,6 +171,59 @@ class ToolkitRegistry:
                     log.debug("Review pipeline toolkit initialisation failed: %s", exc)
                     self._review_toolkit = None
 
+            # Initialize new toolkits
+            if self._signal_logging_toolkit is None:
+                try:
+                    self._signal_logging_toolkit = SignalLoggingToolkit()
+                    await self._signal_logging_toolkit.initialize()
+                    log.info("Toolkit registry prepared Signal Logging toolkit")
+                except Exception as exc:
+                    log.debug("Signal Logging toolkit initialisation failed: %s", exc)
+                    self._signal_logging_toolkit = None
+
+            # ✅ Polymarket Toolkit - core for RSS flux trading
+            if self._polymarket_toolkit is None:
+                try:
+                    self._polymarket_toolkit = EnhancedPolymarketToolkit()
+                    self._polymarket_toolkit.initialize()
+                    LoggingMarkers.info(LoggingMarkers.POLYMARKET, "Initialized toolkit (discovery + analysis + trading)")
+                except Exception as exc:
+                    LoggingMarkers.error(LoggingMarkers.POLYMARKET, "Toolkit init failed: %s", exc)
+                    self._polymarket_toolkit = None
+
+            # ✅ Polymarket Data Toolkit - focused market data + sizing helpers
+            if self._polymarket_data_toolkit is None:
+                try:
+                    self._polymarket_data_toolkit = PolymarketDataToolkit()
+                    self._polymarket_data_toolkit.initialize()
+                    LoggingMarkers.info(LoggingMarkers.POLYMARKET, "Initialized data toolkit (market data + sizing)")
+                except Exception as exc:
+                    LoggingMarkers.error(LoggingMarkers.POLYMARKET, "Data toolkit init failed: %s", exc)
+                    self._polymarket_data_toolkit = None
+
+            # ✅ REMOVED: conversation_logging_toolkit - no longer needed for RSS flux
+            # ✅ REMOVED: wallet_distribution_toolkit - deprecated in favor of Polymarket positions
+
+            if self._search_toolkit_new is None:
+                try:
+                    self._search_toolkit_new = SearchToolkit()
+                    await self._search_toolkit_new.initialize()
+                    log.info("Toolkit registry prepared Search toolkit")
+                except Exception as exc:
+                    log.debug("Search toolkit initialisation failed: %s", exc)
+                    self._search_toolkit_new = None
+
+            # Initialize Yahoo Finance toolkit
+            if self._yahoo_finance_toolkit is None and get_yahoo_finance_toolkit is not None:
+                try:
+                    self._yahoo_finance_toolkit = get_yahoo_finance_toolkit()
+                    await self._yahoo_finance_toolkit.initialize()
+                    log.info("Toolkit registry prepared Yahoo Finance toolkit")
+                except Exception as exc:
+                    log.debug("Yahoo Finance toolkit initialisation failed: %s", exc)
+                    self._yahoo_finance_toolkit = None
+
+
     async def get_default_toolset(self) -> List[FunctionTool]:
         """
         Return the default toolkit collection for the trading workforce.
@@ -114,28 +231,240 @@ class ToolkitRegistry:
         The returned list always contains fresh FunctionTool wrappers so that
         CAMEL can introspect parameter metadata, but the underlying async
         functions reuse shared clients.
+        
+        Tools are validated before being added to the toolset.
         """
         await self.ensure_clients()
 
-        tools = [
-            self._tool("get_stock_forecast", self._tool_get_stock_forecast),
-            self._tool("get_action_recommendation", self._tool_get_action_recommendation),
-            self._tool("list_supported_assets", self._tool_list_supported_assets),
-            self._tool("get_ohlc", self._tool_get_ohlc),
-            self._tool("get_model_metrics", self._tool_get_model_metrics),
-            self._tool("dex_buy_asset", self._tool_dex_buy_asset),
-            self._tool("dex_sell_asset", self._tool_dex_sell_asset),
-            self._tool("dex_get_portfolio", self._tool_dex_get_portfolio),
-            self._tool("get_guidry_cloud_api_stats", self._tool_get_guidry_stats),
-        ]
+        tools = []
+        
+        # ✅ Import tool validator
+        from core.pipelines.tool_validator import validate_tool, validate_tool_schema
+        
+        # Build core tools with error handling and validation
+        # Forecasting-dependent tools only when FORECASTING_MODE != "disabled"
+        core_tools_map = {
+            "get_guidry_cloud_api_stats": self._tool_get_guidry_stats,
+        }
+        if self._is_forecasting_enabled() and self._forecasting_client:
+            core_tools_map.update({
+                "list_supported_assets": self._tool_list_supported_assets,
+                "get_ohlc": self._tool_get_ohlc,
+                "get_model_metrics": self._tool_get_model_metrics,
+            })
 
+        # ✅ Only expose DEX tools when DEX client is available (and thus enabled)
+        if self._dex_client is not None:
+            core_tools_map.update(
+                {
+                    "dex_buy_asset": self._tool_dex_buy_asset,
+                    "dex_sell_asset": self._tool_dex_sell_asset,
+                    "dex_get_portfolio": self._tool_dex_get_portfolio,
+                }
+            )
+        
+        for tool_name, tool_fn in core_tools_map.items():
+            try:
+                tool = self._tool(tool_name, tool_fn)
+                
+                # ✅ Validate tool before adding to toolset
+                if not validate_tool(tool):
+                    log.warning(f"Tool validation failed for {tool_name}, skipping")
+                    continue
+                
+                if not validate_tool_schema(tool):
+                    log.warning(f"Tool schema validation failed for {tool_name}, skipping")
+                    continue
+                
+                tools.append(tool)
+                log.debug(f"✅ Built and validated tool: {tool_name}")
+            except Exception as e:
+                log.error(f"Failed to build tool {tool_name}: {type(e).__name__}: {e}", exc_info=True)
+                # Continue with other tools even if one fails
+                continue
+
+        # ✅ Add optional toolkit tools - verify they're FunctionTool instances and validate them
+        FT = FunctionTool
+        from core.pipelines.tool_validator import validate_tool, validate_tool_schema
+
+        # Prefer explicit-schema API toolkit for forecasting/DQN
+        if self._api_toolkit:
+            try:
+                api_tools = self._api_toolkit.get_all_tools()
+                validated = []
+                for t in api_tools:
+                    if isinstance(t, FT) and validate_tool(t) and validate_tool_schema(t):
+                        validated.append(t)
+                    else:
+                        log.warning("API toolkit tool failed validation or wrong type: %s", getattr(t, "name", "unknown"))
+                tools.extend(validated)
+                log.info("Added %d API forecasting tools with explicit schemas", len(validated))
+            except Exception as exc:
+                log.error("Failed to add API forecasting toolkit tools: %s", exc, exc_info=True)
+        
         if self._asknews_toolkit:
-            tools.extend(self._asknews_toolkit.get_all_tools())
-        if self._search_toolkit:
-            tools.extend(self._search_toolkit.get_all_tools())
+            try:
+                asknews_tools = self._asknews_toolkit.get_all_tools()
+                # Verify all tools are FunctionTool instances and validate them
+                valid_tools = []
+                for t in asknews_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                        else:
+                            log.warning(f"AskNews tool validation failed: {getattr(t, 'name', 'unknown')}")
+                    else:
+                        log.warning(f"AskNews toolkit returned invalid tool (not FunctionTool): {type(t)}")
+                if len(valid_tools) != len(asknews_tools):
+                    log.warning(f"AskNews toolkit: {len(asknews_tools) - len(valid_tools)} tools failed validation")
+                tools.extend(valid_tools)
+                log.debug(f"Added {len(valid_tools)} AskNews tools (all FunctionTool)")
+            except Exception as e:
+                log.warning(f"Failed to add AskNews tools: {e}", exc_info=True)
+        
+        # ✅ DISABLED: Google Research Toolkit is disabled - not useful for trading
+        # if self._search_toolkit:
+        #     ... (disabled)
+        
         if self._review_toolkit:
-            tools.extend(self._review_toolkit.get_all_tools())
+            try:
+                review_tools = self._review_toolkit.get_all_tools()
+                # Verify all tools are FunctionTool instances and validate them
+                valid_tools = []
+                for t in review_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                        else:
+                            log.warning(f"Review pipeline tool validation failed: {getattr(t, 'name', 'unknown')}")
+                    else:
+                        log.warning(f"Review pipeline toolkit returned invalid tool (not FunctionTool): {type(t)}")
+                if len(valid_tools) != len(review_tools):
+                    log.warning(f"Review pipeline toolkit: {len(review_tools) - len(valid_tools)} tools failed validation")
+                tools.extend(valid_tools)
+                log.debug(f"Added {len(valid_tools)} Review pipeline tools (all FunctionTool)")
+            except Exception as e:
+                log.warning(f"Failed to add Review pipeline tools: {e}", exc_info=True)
 
+        # Add Signal Logging toolkit
+        if self._signal_logging_toolkit:
+            try:
+                signal_tools = self._signal_logging_toolkit.get_all_tools()
+                valid_tools = []
+                for t in signal_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                tools.extend(valid_tools)
+                log.debug(f"Added {len(valid_tools)} Signal Logging tools")
+            except Exception as e:
+                log.warning(f"Failed to add Signal Logging tools: {e}", exc_info=True)
+
+        # ✅ Add Polymarket Toolkit - core trading tools
+        if self._polymarket_toolkit:
+            try:
+                polymarket_tools = self._polymarket_toolkit.get_tools()
+                valid_tools = []
+                for t in polymarket_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                        else:
+                            log.warning(f"Polymarket tool validation failed: {getattr(t, 'name', 'unknown')}")
+                    else:
+                        log.warning(f"Polymarket toolkit returned invalid tool (not FunctionTool): {type(t)}")
+                tools.extend(valid_tools)
+                log.info(f"[TOOLKIT REGISTRY] Added {len(valid_tools)} Polymarket trading tools")
+            except Exception as e:
+                log.error(f"[TOOLKIT REGISTRY] Failed to add Polymarket tools: {e}", exc_info=True)
+
+        # ✅ Add Polymarket Data Toolkit tools
+        if self._polymarket_data_toolkit:
+            try:
+                data_tools = self._polymarket_data_toolkit.get_tools()
+                valid_tools = []
+                for t in data_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                        else:
+                            log.warning(f"Polymarket data tool validation failed: {getattr(t, 'name', 'unknown')}")
+                    else:
+                        log.warning(f"Polymarket data toolkit returned invalid tool (not FunctionTool): {type(t)}")
+                tools.extend(valid_tools)
+                log.info(f"[TOOLKIT REGISTRY] Added {len(valid_tools)} Polymarket data tools")
+            except Exception as e:
+                log.error(f"[TOOLKIT REGISTRY] Failed to add Polymarket data tools: {e}", exc_info=True)
+
+        # ✅ REMOVED: Conversation Logging toolkit - no longer needed for RSS flux
+        # ✅ REMOVED: Wallet Distribution toolkit - deprecated in favor of Polymarket positions
+
+        # Add Search toolkit
+        if self._search_toolkit_new:
+            try:
+                search_tools = self._search_toolkit_new.get_all_tools()
+                valid_tools = []
+                for t in search_tools:
+                    if isinstance(t, FT):
+                        if validate_tool(t) and validate_tool_schema(t):
+                            valid_tools.append(t)
+                tools.extend(valid_tools)
+                log.debug(f"Added {len(valid_tools)} Search tools")
+            except Exception as e:
+                log.warning(f"Failed to add Search tools: {e}", exc_info=True)
+
+        # Add Yahoo Finance toolkit tools
+        if self._yahoo_finance_toolkit:
+            try:
+                yahoo_tool_fns = {
+                    "search_financial_news": self._yahoo_finance_toolkit.get_search_news_tool(),
+                    "get_financial_quote": self._yahoo_finance_toolkit.get_quote_tool(),
+                    # get_historical_price_data removed - not used
+                }
+                valid_tools = []
+                for tool_name, tool_fn in yahoo_tool_fns.items():
+                    try:
+                        tool = self._tool(tool_name, tool_fn)
+                        if validate_tool(tool) and validate_tool_schema(tool):
+                            valid_tools.append(tool)
+                        else:
+                            log.warning(f"Yahoo Finance tool validation failed: {tool_name}")
+                    except Exception as e:
+                        log.warning(f"Failed to build Yahoo Finance tool {tool_name}: {e}")
+                if len(valid_tools) != len(yahoo_tool_fns):
+                    log.warning(f"Yahoo Finance toolkit: {len(yahoo_tool_fns) - len(valid_tools)} tools failed validation")
+                tools.extend(valid_tools)
+                log.debug(f"Added {len(valid_tools)} Yahoo Finance tools (all FunctionTool)")
+            except Exception as e:
+                log.warning(f"Failed to add Yahoo Finance tools: {e}", exc_info=True)
+
+
+        # ✅ Final validation: ensure ALL tools are FunctionTool instances
+        from camel.toolkits import FunctionTool as FT
+        valid_tools = [t for t in tools if isinstance(t, FT)]
+        invalid_count = len(tools) - len(valid_tools)
+        
+        if invalid_count > 0:
+            log.error(f"❌ {invalid_count} tools are NOT FunctionTool instances! This will cause CAMEL workforce initialization to fail.")
+            log.error("Invalid tools:")
+            for tool in tools:
+                if not isinstance(tool, FT):
+                    log.error(f"  - {type(tool)}: {tool}")
+            # Return only valid tools to prevent workforce initialization failure
+            tools = valid_tools
+        
+        # ✅ Filter out irrelevant/broken tools
+        # These tools cause workforce failures or are not relevant for trading
+        # ✅ Use ToolValidation utility to filter irrelevant tools
+        filtered_tools, removed_count = ToolValidation.validate_and_filter_tools(tools, require_function_tool=True)
+        if removed_count > 0:
+            LoggingMarkers.info(
+                LoggingMarkers.TOOLKIT_REGISTRY,
+                f"Filtered out {removed_count} irrelevant/broken tools. {len(filtered_tools)} trading-relevant tools remain"
+            )
+            tools = filtered_tools
+        
+        LoggingMarkers.info(LoggingMarkers.TOOLKIT_REGISTRY, f"Built {len(tools)} total FunctionTool instances for CAMEL workforce")
         return tools
 
     # ------------------------------------------------------------------
@@ -169,17 +498,38 @@ class ToolkitRegistry:
         CAMEL's FunctionTool handles the automatic argument inspection and
         JSON schema generation.  The registry memoises wrappers so repeated
         requests do not rebuild the schema.
+        
+        ✅ PURE CAMEL: Uses shared async wrapper for proper event loop handling.
+        Handles both functions and methods correctly.
         """
         if name in self._tool_cache:
             return self._tool_cache[name]
 
         try:
-            tool = FunctionTool(fn)
-        except TypeError as exc:
+            # ✅ Handle methods vs functions: if it's a method, wrap it as a function
+            import inspect
+            if inspect.ismethod(fn):
+                # Create a wrapper function that calls the method
+                async def method_wrapper(*args, **kwargs):
+                    return await fn(*args, **kwargs)
+                method_wrapper.__name__ = name
+                method_wrapper.__doc__ = fn.__doc__
+                fn_to_wrap = method_wrapper
+            else:
+                fn_to_wrap = fn
+                # Ensure function has __name__ attribute
+                if not hasattr(fn_to_wrap, '__name__'):
+                    fn_to_wrap.__name__ = name
+            
+            # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+            from core.camel_tools.async_wrapper import create_function_tool
+            tool = create_function_tool(fn_to_wrap, tool_name=name)
+        except (TypeError, AttributeError) as exc:
             log.error("Failed to wrap tool %s: %s", name, exc)
             raise
 
         # Normalise schema/name so downstream agents see stable identifiers.
+        # ✅ CRITICAL: Ensure full docstring is in the description field for LLM
         try:
             schema = tool.get_openai_tool_schema()
         except Exception as exc:  # pragma: no cover - defensive logging
@@ -190,6 +540,22 @@ class ToolkitRegistry:
             schema = dict(schema)
             function_schema = dict(schema.get("function", {}))
             function_schema["name"] = name
+            
+            # ✅ CRITICAL: Include full docstring in description so LLM sees parameter extraction instructions
+            # The docstring contains critical parameter extraction rules
+            doc = None
+            if inspect.ismethod(fn):
+                doc = fn.__doc__
+            elif hasattr(fn, '__doc__'):
+                doc = fn.__doc__
+            
+            if doc:
+                # Use the full docstring as description (includes parameter extraction rules)
+                function_schema["description"] = doc.strip()
+            elif "description" not in function_schema or not function_schema["description"]:
+                # Fallback to function name if no docstring
+                function_schema["description"] = name
+            
             schema["function"] = function_schema
             tool.openai_tool_schema = schema
 
@@ -293,22 +659,6 @@ class ToolkitRegistry:
         """Return aggregated telemetry for the forecasting API."""
         return {"success": True, "stats": guidry_cloud_stats.summary()}
 
-    async def _tool_browse_url(
-        self,
-        url: str,
-        wait_for_selector: Optional[str] = None,
-        timeout_seconds: float = 15.0,
-        max_characters: int = 2000,
-    ) -> Dict[str, Any]:
-        """Navigate to a URL via Playwright and return rendered snippet."""
-        if not self._playwright_toolkit:
-            raise RuntimeError("Playwright toolkit is not initialised")
-        return await self._playwright_toolkit.browse_url(
-            url=url,
-            wait_for_selector=wait_for_selector,
-            timeout_seconds=timeout_seconds,
-            max_characters=max_characters,
-        )
 
 
 # shared singleton to avoid repeated initialisation
@@ -318,4 +668,3 @@ toolkit_registry = ToolkitRegistry()
 async def build_default_tools() -> List[FunctionTool]:
     """Convenience helper mirroring ToolkitRegistry.get_default_toolset."""
     return await toolkit_registry.get_default_toolset()
-

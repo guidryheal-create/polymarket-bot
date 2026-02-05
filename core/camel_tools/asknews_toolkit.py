@@ -22,7 +22,8 @@ except ImportError:  # pragma: no cover
 try:  # pragma: no cover - optional dependency
     from asknews import AskNewsClient
     ASKNEWS_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    # Catch both ImportError and ModuleNotFoundError (asknews might depend on asknews_sdk)
     AskNewsClient = None  # type: ignore
     ASKNEWS_AVAILABLE = False
 
@@ -31,7 +32,7 @@ class AskNewsToolkit:
     """Expose AskNews search helpers to CAMEL agents."""
 
     def __init__(self, api_key: Optional[str] = None) -> None:
-        self._client: Optional[AskNewsClient] = None
+        self._client: Optional["AskNewsClient"] = None  # String annotation for forward reference
         self._api_key = api_key
 
     async def initialize(self) -> None:
@@ -44,7 +45,7 @@ class AskNewsToolkit:
             self._client = AskNewsClient(api_key=self._api_key)
             log.info("AskNews client initialised.")
 
-    async def _ensure_client(self) -> AskNewsClient:
+    async def _ensure_client(self) -> "AskNewsClient":
         await self.initialize()
         if not self._client:
             raise RuntimeError("AskNews client failed to initialise.")
@@ -87,29 +88,47 @@ class AskNewsToolkit:
             )
 
         asknews_search.__name__ = "asknews_search"
-        tool = FunctionTool(asknews_search)
+        # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+        from core.camel_tools.async_wrapper import create_function_tool
+        tool = create_function_tool(asknews_search)
 
-        try:  # pragma: no cover - schema normalisation
-            schema = dict(tool.get_openai_tool_schema())
-        except Exception:
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": asknews_search.__name__,
-                    "description": asknews_search.__doc__ or asknews_search.__name__,
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "max_results": {"type": "integer", "default": 5},
-                            "language": {"type": "string", "default": "en"},
+        # ✅ CRITICAL: Always use explicit schema override to ensure OpenAI compliance
+        # query is required (no default), max_results and language are optional (have defaults)
+        schema = {
+            "type": "function",
+            "function": {
+                "name": asknews_search.__name__,
+                "description": asknews_search.__doc__ or "Search news articles using AskNews",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query string"
                         },
-                        "required": ["query"],
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return. Defaults to 5 if not specified.",
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Language code (e.g., 'en', 'es', 'fr'). Defaults to 'en' if not specified."
+                        }
                     },
-                },
+                    "required": ["query"],  # Only query is required, others have defaults
+                    "additionalProperties": False
+                }
             }
-        schema["function"]["name"] = asknews_search.__name__
+        }
+        
+        # Override the auto-generated schema to ensure compliance
         tool.openai_tool_schema = schema
+        # Also ensure the tool's internal schema cache is updated
+        if hasattr(tool, '_openai_tool_schema'):
+            tool._openai_tool_schema = schema
+        if hasattr(tool, '_schema'):
+            tool._schema = schema
+        
         return tool
 
     def get_all_tools(self):

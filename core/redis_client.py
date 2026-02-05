@@ -1,6 +1,7 @@
 """
 Redis client for caching, pub/sub, and shared state management.
 """
+import asyncio
 import json
 from datetime import datetime
 from typing import Any, Optional, Dict, List
@@ -29,36 +30,162 @@ class RedisClient:
     async def connect(self):
         """Establish connection to Redis."""
         try:
+            redis_url = settings.redis_url
+            log.info(
+                f"Attempting to connect to Redis",
+                extra={
+                    "redis_host": settings.redis_host,
+                    "redis_port": settings.redis_port,
+                    "redis_db": settings.redis_db,
+                    "redis_url": redis_url
+                }
+            )
             self.redis = await aioredis.from_url(
-                settings.redis_url,
+                redis_url,
                 encoding="utf-8",
                 decode_responses=True,
-                max_connections=50
+                max_connections=50,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                retry_on_timeout=True
             )
             await self.redis.ping()
-            log.info(f"Connected to Redis at {settings.redis_host}:{settings.redis_port}")
+            log.info(
+                f"Successfully connected to Redis",
+                extra={
+                    "redis_host": settings.redis_host,
+                    "redis_port": settings.redis_port,
+                    "redis_db": settings.redis_db
+                }
+            )
         except Exception as e:
-            log.error(f"Failed to connect to Redis: {e}")
+            # Fallback: if host is not localhost, retry once with localhost to aid local runs
+            primary_error = str(e)
+            fallback_tried = False
+            if settings.redis_host not in ("localhost", "127.0.0.1"):
+                fallback_tried = True
+                fallback_url = f"redis://localhost:{settings.redis_port}/{settings.redis_db}"
+                try:
+                    log.warning(
+                        "Primary Redis connection failed, retrying with localhost fallback",
+                        extra={
+                            "redis_host": settings.redis_host,
+                            "redis_port": settings.redis_port,
+                            "redis_db": settings.redis_db,
+                            "redis_url": settings.redis_url,
+                            "fallback_url": fallback_url,
+                            "error": primary_error,
+                            "error_type": type(e).__name__,
+                        },
+                    )
+                    self.redis = await aioredis.from_url(
+                        fallback_url,
+                        encoding="utf-8",
+                        decode_responses=True,
+                        max_connections=50,
+                        socket_connect_timeout=5,
+                        socket_timeout=5,
+                        retry_on_timeout=True,
+                    )
+                    await self.redis.ping()
+                    log.info(
+                        "Connected to Redis via localhost fallback",
+                        extra={"fallback_url": fallback_url},
+                    )
+                    return
+                except Exception as fe:
+                    log.error(
+                        "Fallback Redis connection failed",
+                        extra={
+                            "fallback_url": fallback_url,
+                            "error": str(fe),
+                            "error_type": type(fe).__name__,
+                        },
+                        exc_info=True,
+                    )
+            log.error(
+                "Failed to connect to Redis",
+                extra={
+                    "redis_host": settings.redis_host,
+                    "redis_port": settings.redis_port,
+                    "redis_db": settings.redis_db,
+                    "redis_url": settings.redis_url,
+                    "error": primary_error,
+                    "error_type": type(e).__name__,
+                    "fallback_tried": fallback_tried,
+                },
+                exc_info=True
+            )
             raise
     
     async def disconnect(self):
         """Close Redis connection."""
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()  # Use aclose() instead of close() for async Redis
             log.info("Disconnected from Redis")
     
     async def get(self, key: str) -> Optional[str]:
         """Get value from Redis."""
         try:
-            return await self.redis.get(key)
+            # Check if event loop is closed before attempting operation
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_closed():
+                    log.debug(f"Event loop is closed, skipping Redis GET for key {key}")
+                    return None
+            except RuntimeError:
+                # No running event loop - this is fine for cleanup scenarios
+                log.debug(f"No running event loop, skipping Redis GET for key {key}")
+                return None
+            
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
+            if self.redis is None:
+                log.error(f"Redis connection failed after connect attempt for key {key}")
+                return None
+            result = await self.redis.get(key)
+            # Handle bytes response from redis-py
+            if isinstance(result, bytes):
+                return result.decode('utf-8')
+            return result
+        except RuntimeError as e:
+            # Handle "Event loop is closed" and similar runtime errors
+            error_str = str(e).lower()
+            if "event loop is closed" in error_str or "cannot be called" in error_str:
+                log.debug(f"Event loop closed during Redis GET for key {key}: {e}")
+            else:
+                log.error(f"Redis GET error for key {key}: {e}")
+            return None
         except Exception as e:
-            log.error(f"Redis GET error for key {key}: {e}")
+            log.error(f"Redis GET error for key {key}: {e}", exc_info=True)
             return None
     
     async def set(self, key: str, value: str, expire: Optional[int] = None):
         """Set value in Redis with optional expiration."""
         try:
+            # Check if event loop is closed before attempting operation
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_closed():
+                    log.debug(f"Event loop is closed, skipping Redis SET for key {key}")
+                    return
+            except RuntimeError:
+                # No running event loop - this is fine for cleanup scenarios
+                log.debug(f"No running event loop, skipping Redis SET for key {key}")
+                return
+            
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
             await self.redis.set(key, value, ex=expire)
+        except RuntimeError as e:
+            # Handle "Event loop is closed" and similar runtime errors
+            error_str = str(e).lower()
+            if "event loop is closed" in error_str or "cannot be called" in error_str:
+                log.debug(f"Event loop closed during Redis SET for key {key}: {e}")
+            else:
+                log.error(f"Redis SET error for key {key}: {e}")
         except Exception as e:
             log.error(f"Redis SET error for key {key}: {e}")
     
@@ -79,6 +206,9 @@ class RedisClient:
     async def delete(self, key: str):
         """Delete key from Redis."""
         try:
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
             await self.redis.delete(key)
         except Exception as e:
             log.error(f"Redis DELETE error for key {key}: {e}")
@@ -162,6 +292,9 @@ class RedisClient:
     async def lpush(self, key: str, *values: str):
         """Push values to list (left)."""
         try:
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
             await self.redis.lpush(key, *values)
         except Exception as e:
             log.error(f"Redis LPUSH error for key {key}: {e}")
@@ -172,10 +305,23 @@ class RedisClient:
             await self.redis.rpush(key, *values)
         except Exception as e:
             log.error(f"Redis RPUSH error for key {key}: {e}")
+
+    async def expire(self, key: str, seconds: int):
+        """Set expiration on a key (compat helper for toolkits)."""
+        try:
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
+            await self.redis.expire(key, seconds)
+        except Exception as e:
+            log.error(f"Redis EXPIRE error for key {key}: {e}")
     
     async def lrange(self, key: str, start: int, end: int) -> List[str]:
         """Get range of list elements."""
         try:
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
             return await self.redis.lrange(key, start, end)
         except Exception as e:
             log.error(f"Redis LRANGE error for key {key}: {e}")
@@ -184,6 +330,9 @@ class RedisClient:
     async def ltrim(self, key: str, start: int, end: int):
         """Trim list to specified range."""
         try:
+            if self.redis is None:
+                log.warning(f"Redis client not connected, attempting to connect for key {key}")
+                await self.connect()
             await self.redis.ltrim(key, start, end)
         except Exception as e:
             log.error(f"Redis LTRIM error for key {key}: {e}")

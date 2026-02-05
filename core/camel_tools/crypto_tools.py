@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional, Annotated
 from pydantic import Field
 from core.config import settings
 from core.logging import log
-from core.forecasting_client import ForecastingClient
+from core.clients.forecasting_client import ForecastingClient
 
 try:
     from camel.toolkits import FunctionTool  # type: ignore
@@ -194,7 +194,9 @@ class CryptoTools:
         if not CAMEL_TOOLS_AVAILABLE or FunctionTool is None:
             raise ImportError("CAMEL function tools not installed")
 
-        tool = FunctionTool(func)
+        # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+        from core.camel_tools.async_wrapper import create_function_tool
+        tool = create_function_tool(func)
         try:
             schema = dict(tool.get_openai_tool_schema())
         except Exception:

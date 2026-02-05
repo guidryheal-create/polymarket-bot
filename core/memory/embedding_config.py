@@ -3,6 +3,8 @@ Embedding Model Configuration for CAMEL Memory
 
 Supports OpenAI embeddings and Ollama embeddings (lightweight, no PyTorch required).
 """
+from __future__ import annotations
+
 from typing import Optional
 from core.config import settings
 from core.logging import log
@@ -26,7 +28,7 @@ except ImportError:
 class EmbeddingFactory:
     """Factory for creating embedding model instances."""
     
-    _embedding_cache: Optional[BaseEmbedding] = None
+    _embedding_cache: Optional["BaseEmbedding"] = None  # String annotation for forward reference
     
     @classmethod
     def create_embedding(
@@ -34,7 +36,7 @@ class EmbeddingFactory:
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
         provider: Optional[str] = None
-    ) -> BaseEmbedding:
+    ) -> "BaseEmbedding":
         """
         Create an embedding model instance.
         
@@ -58,9 +60,25 @@ class EmbeddingFactory:
                 if not OLLAMA_AVAILABLE:
                     raise ImportError("Ollama embedding not available. Check core.memory.ollama_embedding")
                 
+                # Get working Ollama URL (with localhost fallback if needed)
+                ollama_url = settings.ollama_url
+                # If Docker service name and we're outside Docker, try localhost fallback but keep original if it fails
+                if "ollama" in ollama_url and "localhost" not in ollama_url:
+                    localhost_url = ollama_url.replace("ollama", "localhost")
+                    try:
+                        import httpx
+                        with httpx.Client(timeout=1.0) as client:
+                            response = client.get(f"{localhost_url}/api/tags")
+                            if response.status_code == 200:
+                                ollama_url = localhost_url
+                                log.debug(f"Using localhost Ollama URL: {localhost_url}")
+                    except Exception:
+                        # keep original docker service URL
+                        pass
+                
                 embedding = OllamaEmbedding(
                     model=model_name or settings.ollama_model,
-                    base_url=settings.ollama_url
+                    base_url=ollama_url
                 )
                 log.info(f"Created Ollama embedding model: {model_name or settings.ollama_model}")
             
@@ -73,9 +91,26 @@ class EmbeddingFactory:
                 if not api_key:
                     log.warning("No OpenAI API key provided for embeddings, falling back to Ollama")
                     if OLLAMA_AVAILABLE:
+                        # Get working Ollama URL (with localhost fallback if needed)
+                        ollama_url = settings.ollama_url
+                        # If Docker service name and we're outside Docker, use localhost
+                        if "ollama:11434" in ollama_url or ("ollama" in ollama_url and "localhost" not in ollama_url):
+                            # Try localhost fallback
+                            localhost_url = ollama_url.replace("ollama", "localhost")
+                            # Test if localhost works (quick check)
+                            try:
+                                import httpx
+                                with httpx.Client(timeout=1.0) as client:
+                                    response = client.get(f"{localhost_url}/api/tags")
+                                    if response.status_code == 200:
+                                        ollama_url = localhost_url
+                                        log.debug(f"Using localhost Ollama URL: {localhost_url}")
+                            except Exception:
+                                pass  # Keep original URL if localhost doesn't work
+                        
                         embedding = OllamaEmbedding(
                             model=settings.ollama_model,
-                            base_url=settings.ollama_url
+                            base_url=ollama_url
                         )
                         log.info(f"Fell back to Ollama embedding: {settings.ollama_model}")
                     else:

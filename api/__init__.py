@@ -1,4 +1,1 @@
-"""
-API package for the Agentic Trading System.
-"""
-
+"""API package init"""

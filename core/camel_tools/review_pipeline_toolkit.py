@@ -1,17 +1,16 @@
 """
 CAMEL toolkit exposing the weight review pipeline as a callable tool.
 
-Agents can invoke the tool to trigger an immediate weight review cycle and
-retrieve the resulting snapshot (weights, explanation, metrics).  This allows
-the CAMEL workforce to reason about agent weighting adjustments without
-waiting for the scheduled memory agent cycle.
+✅ REMOVED: review_pipeline module was deleted - using pure CAMEL workforce tasks instead.
+This toolkit is now a stub to prevent import errors.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from core.pipelines.review_pipeline import WeightReviewPipeline, REDIS_REVIEW_KEY
+# ✅ REMOVED: review_pipeline import (module deleted - using CAMEL workforce tasks instead)
+# from core.pipelines.review_pipeline import WeightReviewPipeline, REDIS_REVIEW_KEY
 from core.redis_client import redis_client
 
 try:  # pragma: no cover - optional dependency
@@ -39,50 +38,55 @@ class ReviewPipelineToolkit:
             """
             Execute the weight review pipeline and return the latest snapshot.
 
+            ✅ STUB: review_pipeline module was deleted - using CAMEL workforce tasks instead.
+            This tool is disabled to prevent errors.
+
             Args:
                 trigger: Label describing the caller (defaults to 'camel_tool').
 
             Returns:
-                Dictionary containing updated weights and the stored snapshot.
+                Dictionary indicating the tool is disabled.
             """
-
-            pipeline = WeightReviewPipeline(self.redis)
-            weights = await pipeline.run(trigger=trigger)
-            snapshot = await self.redis.get_json(REDIS_REVIEW_KEY)  # type: ignore[attr-defined]
             return {
-                "success": True,
-                "weights": weights,
-                "snapshot": snapshot,
+                "success": False,
+                "error": "Weight review pipeline removed - use CAMEL workforce tasks instead",
+                "message": "This tool is disabled. Weight review should be handled via CAMEL workforce tasks.",
             }
 
         run_weight_review.__name__ = "run_weight_review"
-        tool = FunctionTool(run_weight_review)
+        # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+        from core.camel_tools.async_wrapper import create_function_tool
+        tool = create_function_tool(run_weight_review)
 
-        try:  # pragma: no cover - schema normalisation
-            schema = dict(tool.get_openai_tool_schema())
-        except Exception:
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": "run_weight_review",
-                    "description": run_weight_review.__doc__ or "",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "trigger": {
-                                "type": "string",
-                                "description": "Label describing the caller or reason for review.",
-                            }
-                        },
-                        "required": [],
+        # ✅ CRITICAL: Always use explicit schema override to ensure OpenAI compliance
+        # trigger has a default value ("camel_tool"), so it's optional and should NOT be in required
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "run_weight_review",
+                "description": run_weight_review.__doc__ or "Execute the weight review pipeline and return the latest snapshot",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "trigger": {
+                            "type": "string",
+                            "description": "Label describing the caller or reason for review. Defaults to 'camel_tool' if not specified."
+                        }
                     },
-                },
+                    "required": [],  # trigger has a default, so it's optional
+                    "additionalProperties": False
+                }
             }
-
-        function_schema = schema.setdefault("function", {})
-        function_schema["name"] = "run_weight_review"
-        function_schema.setdefault("description", run_weight_review.__doc__ or "")
+        }
+        
+        # Override the auto-generated schema to ensure compliance
         tool.openai_tool_schema = schema
+        # Also ensure the tool's internal schema cache is updated
+        if hasattr(tool, '_openai_tool_schema'):
+            tool._openai_tool_schema = schema
+        if hasattr(tool, '_schema'):
+            tool._schema = schema
+        
         return tool
 
     def get_all_tools(self):

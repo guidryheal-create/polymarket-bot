@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -13,7 +14,50 @@ from typing import Any, Dict
 from loguru import logger
 from redis import Redis
 
-from core.config import settings
+# Lazy import settings to avoid circular dependency
+_settings = None
+
+
+def _get_settings():
+    """Get settings with lazy loading."""
+    global _settings
+    if _settings is None:
+        # This import must happen AFTER core/__init__.py exists
+        # but BEFORE settings is used for the first time
+        # Try to import the actual settings object from the config module
+        try:
+            # The config.py file at the same level
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "core_config_module",
+                Path(__file__).parent / "config.py"
+            )
+            if spec and spec.loader:
+                config_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(config_module)
+                _settings = config_module.settings
+            else:
+                # Fallback: create default settings
+                from core.config import Settings
+                _settings = Settings()
+        except Exception:
+            # Last resort: create default settings
+            try:
+                from core.config import Settings
+                _settings = Settings()
+            except Exception:
+                # Return a minimal mock to prevent complete failure
+                class MockSettings:
+                    logfire_token = None
+                    log_level = "INFO"
+                    app_name = "Agentic Trading System"
+                    environment = "development"
+                    log_file_path = "logs/app.log"
+                    redis_host = "localhost"
+                    redis_port = 6379
+                    redis_db = 0
+                _settings = MockSettings()
+    return _settings
 
 
 def _resolve_log_path(default_path: Path) -> Path:
@@ -27,6 +71,7 @@ def _resolve_log_path(default_path: Path) -> Path:
 
 
 def _configure_logfire() -> None:
+    settings = _get_settings()
     if not settings.logfire_token:
         return
 
@@ -66,6 +111,7 @@ class RedisLogSink:
         self.key = key
         self.max_entries = max_entries
         try:
+            settings = _get_settings()
             self.client = Redis(
                 host=settings.redis_host,
                 port=settings.redis_port,
@@ -102,61 +148,129 @@ class RedisLogSink:
 
 def setup_logging():
     """Configure loguru logger with appropriate settings."""
+    settings = _get_settings()
 
     logger.remove()
     logger.configure(extra={"cluster": settings.cluster_name, "instance": settings.agent_instance_id})
 
+    # Determine log level - normalise to uppercase for loguru
+    import os
+    log_level = (settings.log_level or "INFO").upper()
+    # Allow LOG_LEVEL env override (e.g. debug/trace) used in tests/docker
+    env_level = os.getenv("LOG_LEVEL", "").upper()
+    if env_level:
+        log_level = env_level
+    
     logger.add(
         sys.stdout,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | "
         "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        level=settings.log_level,
+        level=log_level,
         colorize=True,
     )
 
     base_log_path = Path(settings.log_file)
     log_path = _resolve_log_path(base_log_path)
+    
+    # File sink with robust fallback for permission issues (e.g. local tests)
+    try:
+        logger.add(
+            log_path,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="DEBUG",
+            rotation="100 MB",
+            retention="30 days",
+            compression="zip",
+        )
+    except PermissionError:
+        # Fall back to a temp directory that is always writable
+        tmp_dir = Path("/tmp/agentic_test_logs")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        fallback_path = tmp_dir / base_log_path.name
+        logger.add(
+            fallback_path,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="DEBUG",
+            rotation="100 MB",
+            retention="30 days",
+            compression="zip",
+        )
 
-    logger.add(
-        log_path,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        level="DEBUG",
-        rotation="100 MB",
-        retention="30 days",
-        compression="zip",
-    )
-
+    # Error log sink with permission fallback
     error_log_path = _resolve_log_path(log_path.parent / "errors.log")
-    logger.add(
-        str(error_log_path),
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        level="ERROR",
-        rotation="50 MB",
-        retention="90 days",
-        compression="zip",
-    )
-
+    try:
+        logger.add(
+            str(error_log_path),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="ERROR",
+            rotation="50 MB",
+            retention="90 days",
+            compression="zip",
+        )
+    except PermissionError:
+        tmp_dir = Path("/tmp/agentic_test_logs")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        fallback_error = tmp_dir / "errors.log"
+        logger.add(
+            str(fallback_error),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="ERROR",
+            rotation="50 MB",
+            retention="90 days",
+            compression="zip",
+        )
+    
+    # Trading decisions log
     trading_log_path = _resolve_log_path(log_path.parent / "trading_decisions.log")
-    logger.add(
-        str(trading_log_path),
-        format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
-        level="INFO",
-        filter=lambda record: record["extra"].get("TRADE_DECISION"),
-        rotation="50 MB",
-        retention="365 days",
-        compression="zip",
-    )
-
+    try:
+        logger.add(
+            str(trading_log_path),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+            level="INFO",
+            filter=lambda record: record["extra"].get("TRADE_DECISION"),
+            rotation="50 MB",
+            retention="365 days",
+            compression="zip",
+        )
+    except PermissionError:
+        tmp_dir = Path("/tmp/agentic_test_logs")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        fallback_trading = tmp_dir / "trading_decisions.log"
+        logger.add(
+            str(fallback_trading),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+            level="INFO",
+            filter=lambda record: record["extra"].get("TRADE_DECISION"),
+            rotation="50 MB",
+            retention="365 days",
+            compression="zip",
+        )
+    
+    # Portfolio plans log
     portfolio_log_path = _resolve_log_path(log_path.parent / "portfolio_plans.log")
-    logger.add(
-        str(portfolio_log_path),
-        format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
-        level="INFO",
-        filter=lambda record: record["extra"].get("PORTFOLIO_PLAN"),
-        rotation="50 MB",
-        retention="365 days",
-        compression="zip",
-    )
+    try:
+        logger.add(
+            str(portfolio_log_path),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+            level="INFO",
+            filter=lambda record: record["extra"].get("PORTFOLIO_PLAN"),
+            rotation="50 MB",
+            retention="365 days",
+            compression="zip",
+        )
+    except PermissionError:
+        tmp_dir = Path("/tmp/agentic_test_logs")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        fallback_portfolio = tmp_dir / "portfolio_plans.log"
+        logger.add(
+            str(fallback_portfolio),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+            level="INFO",
+            filter=lambda record: record["extra"].get("PORTFOLIO_PLAN"),
+            rotation="50 MB",
+            retention="365 days",
+            compression="zip",
+        )
 
     if settings.log_redis_enabled:
         redis_sink = RedisLogSink(settings.log_redis_list_key, settings.log_redis_max_entries)
@@ -186,5 +300,22 @@ def setup_logging():
     return logger
 
 
-log = setup_logging()
+# Initialize log AFTER defining all helper functions
+_log = None
+
+
+def _get_log():
+    """Get or initialize the logger."""
+    global _log
+    if _log is None:
+        try:
+            _log = setup_logging()
+        except Exception:
+            # Fallback: create minimal logger if setup fails
+            _log = logger
+    return _log
+
+
+# Export log for backward compatibility
+log = _get_log()
 

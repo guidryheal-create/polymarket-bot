@@ -15,7 +15,8 @@ _asset_lock = asyncio.Lock()
 _assets: List[str] = []
 _symbol_map: Dict[str, str] = {}
 _intervals_map: Dict[str, List[str]] = {}
-_disabled_assets: Set[str] = set()
+_manual_disabled_assets: Set[str] = {asset.upper() for asset in settings.manual_disabled_assets}
+_disabled_assets: Set[str] = set(_manual_disabled_assets)
 
 # Reasonable defaults based on currently enabled assets exposed by the forecasting API
 _FALLBACK_ASSETS: List[str] = [
@@ -31,7 +32,6 @@ _FALLBACK_ASSETS: List[str] = [
     "SAND",
     "SOL",
     "SUI",
-    "USDC",
     "XRP",
 ]
 
@@ -85,6 +85,8 @@ async def update_assets(
 
     async with _asset_lock:
         for asset in reenabled_assets:
+            if asset in _manual_disabled_assets:
+                continue
             _disabled_assets.discard(asset)
 
         _assets.clear()
@@ -174,5 +176,6 @@ def reset_disabled_assets() -> None:
     """Clear the disabled asset cache (primarily for tests)."""
 
     _disabled_assets.clear()
+    _disabled_assets.update(_manual_disabled_assets)
 
 

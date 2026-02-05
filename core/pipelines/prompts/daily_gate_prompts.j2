@@ -1,0 +1,19 @@
+Generate daily trading decision for {{ ticker }} using strategy {{ strategy_mode }}.
+
+**Context:**
+- Ticker: {{ ticker }}
+- Strategy: {{ strategy_mode }}
+- Interval: daily
+- Use tools to gather DQN forecasts, technical analysis, news sentiment, and risk metrics.
+
+**Required Output (use response_format):**
+- action: BUY, SELL, or HOLD
+- confidence: 0.0-1.0
+- percent_allocation: 0.0-1.0
+- rationale: Explanation
+- blended_score: -1.0 to 1.0
+- priority_score: 0.0-1.0
+- ai_explanation: Short report
+
+Coordinate with Fact, Trend, and Fusion workers to produce final decision.
+

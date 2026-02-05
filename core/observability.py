@@ -370,7 +370,7 @@ class HealthChecker:
     async def check_forecasting_api_health() -> Dict[str, Any]:
         """Check forecasting API health."""
         try:
-            from core.forecasting_client import forecasting_client
+            from core.clients.forecasting_client import forecasting_client
             # This would need to be implemented in forecasting_client
             return {"status": "healthy", "api": "forecasting"}
         except Exception as e:

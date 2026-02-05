@@ -8,7 +8,7 @@ from typing import Dict, Any, Annotated
 from pydantic import Field
 from core.logging import log
 from core.config import settings
-from core.blockscout_client import BlockscoutMCPClient, BlockscoutMCPError
+from core.clients.blockscout_client import BlockscoutMCPClient, BlockscoutMCPError
 
 
 # Global toolkit instance
@@ -51,8 +51,14 @@ class BlockscoutMCPToolkit:
             """
             List all EVM-compatible blockchain networks supported by Blockscout.
             
+            Returns a dictionary with success status, chains list, and total count.
+            Each chain entry includes metadata such as chain ID, name, and network information.
+            
             Returns:
-                List of supported chains with metadata
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - chains (list): List of supported chains with metadata
+                    - total_chains (int): Total number of supported chains
             """
             try:
                 await toolkit_instance.initialize()
@@ -91,15 +97,25 @@ class BlockscoutMCPToolkit:
             token_address: Annotated[str, Field(description="Optional token contract address for token balance", default=None)] = None
         ) -> Dict[str, Any]:
             """
-            Get wallet balance for an address on a specific chain.
+            Get wallet balance for an address on a specific EVM chain.
+            
+            Retrieves both native token (ETH, MATIC, etc.) and ERC-20 token balances.
+            If token_address is provided, returns balance for that specific token.
             
             Args:
-                address: Wallet address (0x...)
-                chain: Chain name (default: ethereum)
-                token_address: Optional token contract address for token balance
+                address: Wallet address in 0x format (e.g., 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb)
+                chain: Chain name (e.g., ethereum, polygon, arbitrum, bsc). Default: ethereum
+                token_address: Optional ERC-20 token contract address. If None, returns all token balances
                 
             Returns:
-                Balance information including native token and token balances
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - address (str): The queried wallet address
+                    - chain (str): The chain name
+                    - native_balance (str): Native token balance (e.g., ETH balance)
+                    - token_balances (list): List of ERC-20 token balances if token_address is None
+                    - token_balance (str): Specific token balance if token_address is provided
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()
@@ -146,16 +162,27 @@ class BlockscoutMCPToolkit:
             offset: Annotated[int, Field(description="Pagination offset", default=0)] = 0
         ) -> Dict[str, Any]:
             """
-            Get transaction history for an address.
+            Get transaction history for a wallet address on a specific EVM chain.
+            
+            Retrieves a paginated list of transactions (both sent and received) for the given address.
+            Transactions include details such as hash, timestamp, value, gas fees, and status.
             
             Args:
-                address: Wallet address
-                chain: Chain name
-                limit: Number of transactions to return (default: 50)
-                offset: Pagination offset (default: 0)
+                address: Wallet address in 0x format
+                chain: Chain name (e.g., ethereum, polygon, arbitrum). Default: ethereum
+                limit: Maximum number of transactions to return (1-100). Default: 50
+                offset: Pagination offset for retrieving older transactions. Default: 0
                 
             Returns:
-                List of transactions with details
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - address (str): The queried wallet address
+                    - chain (str): The chain name
+                    - transactions (list): List of transaction objects with full details
+                    - count (int): Number of transactions returned
+                    - limit (int): The limit parameter used
+                    - offset (int): The offset parameter used
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()
@@ -208,12 +235,24 @@ class BlockscoutMCPToolkit:
             """
             Get smart contract information including source code, ABI, and verification status.
             
+            Retrieves comprehensive contract details including verified source code, ABI (Application Binary Interface),
+            compiler version, and optimization settings. Useful for contract analysis and interaction.
+            
             Args:
-                contract_address: Contract address
-                chain: Chain name
+                contract_address: Smart contract address in 0x format
+                chain: Chain name (e.g., ethereum, arbitrum, polygon). Default: ethereum
                 
             Returns:
-                Contract information including source code, ABI, compiler version, and verification status
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - contract_address (str): The queried contract address
+                    - chain (str): The chain name
+                    - source_code (str): Verified contract source code
+                    - abi (list): Contract ABI (JSON interface)
+                    - compiler_version (str): Solidity compiler version used
+                    - optimization_enabled (bool): Whether optimization was enabled
+                    - verification_status (str): Contract verification status
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()
@@ -257,14 +296,27 @@ class BlockscoutMCPToolkit:
             chain: Annotated[str, Field(description="Chain name (e.g., ethereum, polygon)", default="ethereum")] = "ethereum"
         ) -> Dict[str, Any]:
             """
-            Get token information (ERC-20/ERC-721).
+            Get token information for ERC-20 or ERC-721 tokens.
+            
+            Retrieves comprehensive token metadata including name, symbol, decimals, total supply,
+            token type (ERC-20 fungible or ERC-721 NFT), and holder count.
             
             Args:
-                token_address: Token contract address
-                chain: Chain name
+                token_address: Token contract address in 0x format
+                chain: Chain name (e.g., ethereum, polygon, arbitrum). Default: ethereum
                 
             Returns:
-                Token information including name, symbol, decimals, total supply, and type
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - token_address (str): The queried token address
+                    - chain (str): The chain name
+                    - name (str): Token name (e.g., "Wrapped Ether")
+                    - symbol (str): Token symbol (e.g., "WETH")
+                    - decimals (int): Number of decimals (typically 18 for ERC-20)
+                    - total_supply (str): Total token supply
+                    - token_type (str): "ERC-20" or "ERC-721"
+                    - holders_count (int): Number of token holders
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()
@@ -308,14 +360,30 @@ class BlockscoutMCPToolkit:
             chain: Annotated[str, Field(description="Chain name (e.g., ethereum, polygon)", default="ethereum")] = "ethereum"
         ) -> Dict[str, Any]:
             """
-            Get detailed transaction information.
+            Get detailed transaction information by transaction hash.
+            
+            Retrieves comprehensive transaction details including sender/receiver addresses, value transferred,
+            gas used, gas price, transaction status (success/failed), block number, timestamp, and event logs.
             
             Args:
-                tx_hash: Transaction hash
-                chain: Chain name
+                tx_hash: Transaction hash (0x-prefixed hex string)
+                chain: Chain name (e.g., ethereum, polygon, arbitrum). Default: ethereum
                 
             Returns:
-                Transaction details including from/to addresses, value, gas, status, and logs
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - tx_hash (str): The queried transaction hash
+                    - chain (str): The chain name
+                    - from_address (str): Sender wallet address
+                    - to_address (str): Receiver wallet address
+                    - value (str): Amount transferred in native token (wei)
+                    - gas_used (int): Gas units consumed
+                    - gas_price (str): Gas price in wei
+                    - status (str): Transaction status ("success" or "failed")
+                    - block_number (int): Block number containing the transaction
+                    - timestamp (str): Transaction timestamp
+                    - logs (list): Event logs emitted by the transaction
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()
@@ -359,14 +427,25 @@ class BlockscoutMCPToolkit:
             chain: Annotated[str, Field(description="Chain name (e.g., ethereum, polygon)", default="ethereum")] = "ethereum"
         ) -> Dict[str, Any]:
             """
-            Compare multiple wallets (balances, activity, etc.).
+            Compare multiple wallets across balances, activity, and statistics.
+            
+            Analyzes and compares multiple wallet addresses on the same chain, providing aggregated
+            statistics such as total balances, transaction counts, activity levels, and balance distributions.
             
             Args:
-                addresses: Comma-separated list of wallet addresses
-                chain: Chain name
+                addresses: Comma-separated list of wallet addresses in 0x format (e.g., "0x123...,0x456...")
+                chain: Chain name (e.g., ethereum, polygon, arbitrum). Default: ethereum
                 
             Returns:
-                Comparison data including balances and statistics
+                Dict containing:
+                    - success (bool): Whether the operation succeeded
+                    - addresses (list): List of compared wallet addresses
+                    - chain (str): The chain name
+                    - total_balance (str): Sum of all wallet balances
+                    - average_balance (str): Average balance across wallets
+                    - wallet_stats (list): Per-wallet statistics including balance and transaction count
+                    - comparison_metrics (dict): Aggregated comparison metrics
+                    - error (str): Error message if success is False
             """
             try:
                 await toolkit_instance.initialize()

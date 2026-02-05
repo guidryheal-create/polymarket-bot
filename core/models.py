@@ -287,11 +287,18 @@ class GraphMemoryEdge(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class TrendTableEntry(BaseModel):
+    """Entry in trend table: [date, real|"_", pred] format."""
+    date: str  # ISO8601 datetime string
+    real: Optional[float] = None  # Real price or "_" if not yet known
+    pred: float  # Predicted price
+
+
 class TrendAssessment(BaseModel):
     """Aggregated trend assessment derived from DQN and technical analysis pipelines."""
     ticker: str
     trend_score: float  # 0-1 composite score
-    momentum: float  # 0-1 momentum strength
+    momentum: Optional[float] = None  # 0-1 momentum strength (can be None if not calculable)
     volatility: Optional[float] = None
     recommended_action: TradeAction
     confidence: float
@@ -299,6 +306,11 @@ class TrendAssessment(BaseModel):
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     agentic: bool = True
     ai_explanation: Optional[str] = None
+    # ✅ Agent schema alignment: distributions, value_estimate, trend_table
+    decision_distribution: Dict[str, float] = Field(default_factory=dict)  # {"BUY": 0.7, "HOLD": 0.2, "SELL": 0.1}
+    value_estimate: Optional[float] = None  # Value estimate (-1.0 to 1.0)
+    trend_table: List[TrendTableEntry] = Field(default_factory=list)  # T-5 to T+delta trend table
+    risk_flags: List[str] = Field(default_factory=list)  # Risk flags (e.g., "high_volatility", "divergence")
 
 
 class FactInsight(BaseModel):
@@ -314,6 +326,55 @@ class FactInsight(BaseModel):
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     agentic: bool = True
     ai_explanation: Optional[str] = None
+    # ✅ Agent schema alignment: distributions, value_estimate, risk flags
+    decision_distribution: Dict[str, float] = Field(default_factory=dict)  # {"BUY": 0.6, "HOLD": 0.3, "SELL": 0.1}
+    value_estimate: Optional[float] = None  # Value estimate (-1.0 to 1.0, derived from sentiment)
+    risk_flags: List[str] = Field(default_factory=list)  # Risk flags (e.g., "negative_sentiment", "market_fear")
+
+
+class AgentReportComponent(BaseModel):
+    """Report from a single agent (Trend, Fact, Memory, etc)."""
+    agent: str  # "TrendAgent", "FactAgent", "MemoryAgent", etc.
+    decision: str  # "BUY", "HOLD", "SELL"
+    dist: Dict[str, float] = Field(default_factory=dict)  # {"BUY": 0.7, "HOLD": 0.2, "SELL": 0.1}
+    explanation: Optional[str] = None
+    value_estimate: Optional[float] = None
+
+
+class FusionReportDetail(BaseModel):
+    """Detailed report from fusion decision."""
+    method: str = "dqn_argmax"  # Decision method
+    picked: str  # Final action chosen
+    distribution: Dict[str, float] = Field(default_factory=dict)  # Final fused distribution
+    utility_scores: Dict[str, float] = Field(default_factory=dict)  # Utility score for each action
+
+
+class DetailedReportPayload(BaseModel):
+    """Detailed breakdown of fusion decision by agent."""
+    agents: List[AgentReportComponent] = Field(default_factory=list)
+    fusion: Optional[FusionReportDetail] = None
+
+
+class FusionResponseFormat(BaseModel):
+    """
+    Complete response format for fusion decisions (daily workforce + hourly pipelines).
+    
+    This is the canonical output shape for all fusion decisions across strategies
+    and intervals. It includes trend history, detailed agent reports, and
+    complete traceability for user-facing UI and internal analysis.
+    """
+    symbol: str  # Ticker symbol
+    trade_date: str  # ISO8601 date for T+1 trade execution
+    horizon: str  # "T+1h", "T+1d", etc.
+    trend_table: List[TrendTableEntry] = Field(default_factory=list)  # T-5 to T+delta history
+    final_decision: str  # "BUY", "HOLD", "SELL"
+    decision_score: float  # Fused utility score (0.0-1.0)
+    position_pct: float  # Wallet allocation (0.0-1.0)
+    stop_loss_lower: float  # Lower stop-loss band (e.g., -0.03)
+    stop_loss_upper: float  # Upper stop-loss band (e.g., +0.015)
+    short_explanation: str  # One-line UI explanation
+    detailed_report: Optional[DetailedReportPayload] = None
+    log_id: str  # Unique trace ID for this decision
 
 
 class FusionRecommendation(BaseModel):
@@ -330,4 +391,6 @@ class FusionRecommendation(BaseModel):
     generated_at: datetime = Field(default_factory=datetime.utcnow)
     agentic: bool = True
     ai_explanation: Optional[str] = None
+    priority_score: Optional[float] = None
+    wallet_percent_allocation: Optional[float] = None
 

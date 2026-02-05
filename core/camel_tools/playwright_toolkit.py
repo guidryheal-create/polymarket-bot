@@ -179,7 +179,9 @@ class PlaywrightToolkit:
             "Navigate to a URL headlessly using Playwright and return a snippet of the rendered page."
         )
 
-        tool = FunctionTool(browse_url)
+        # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+        from core.camel_tools.async_wrapper import create_function_tool
+        tool = create_function_tool(browse_url)
         try:  # pragma: no cover - schema normalisation
             schema = dict(tool.get_openai_tool_schema())
         except Exception:

@@ -66,6 +66,7 @@ class GuidryCloudStats:
         timeout: bool = False,
         rate_limited: bool = False,
         disabled_asset: Optional[str] = None,
+        connection_error: bool = False,
     ) -> None:
         sample = RequestSample(
             endpoint=endpoint,
@@ -81,6 +82,9 @@ class GuidryCloudStats:
             if rate_limited:
                 self._rate_limit_hits += 1
             if timeout:
+                self._timeouts += 1
+            if connection_error:
+                # Track as timeout-equivalent for telemetry purposes
                 self._timeouts += 1
             if disabled_asset:
                 ticker = disabled_asset.upper()

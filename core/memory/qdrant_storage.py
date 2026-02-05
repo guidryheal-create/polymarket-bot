@@ -3,6 +3,8 @@ Qdrant Storage Configuration for CAMEL Memory
 
 Integrates Qdrant vector database with CAMEL's storage interface.
 """
+from __future__ import annotations
+
 from typing import Optional, Dict, Any
 from core.config import settings
 from core.logging import log
@@ -20,11 +22,11 @@ except ImportError:
 class QdrantStorageFactory:
     """Factory for creating Qdrant storage instances."""
     
-    _client: Optional[QdrantClient] = None
+    _client: Optional["QdrantClient"] = None  # String annotation for forward reference
     _storage_cache: Dict[str, Any] = {}
     
     @classmethod
-    def get_client(cls) -> QdrantClient:
+    def get_client(cls) -> "QdrantClient":
         """Get or create Qdrant client."""
         if not QDRANT_AVAILABLE:
             raise ImportError("Qdrant dependencies not installed")

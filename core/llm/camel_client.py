@@ -2,8 +2,8 @@
 Asynchronous helper for invoking CAMEL-backed LLMs.
 
 Wraps CAMEL's `ChatAgent` so async agent code can request completions without
-depending on the synchronous API directly.  The client favours OpenRouter
-models (falling back to whichever model name is supplied).
+depending on the synchronous API directly.  The client uses OpenAI models by
+default (falling back to whichever model name is supplied).
 """
 
 from __future__ import annotations
@@ -14,6 +14,11 @@ from typing import Callable, Optional
 
 from core.logging import log
 from core.models.camel_models import CamelModelFactory
+
+try:  # optional dependency during tests
+    from openai import AuthenticationError  # type: ignore
+except ImportError:  # pragma: no cover
+    AuthenticationError = Exception  # type: ignore
 
 try:  # pragma: no cover - exercised at runtime when CAMEL is installed
     from camel.agents import ChatAgent
@@ -104,6 +109,10 @@ class CamelLLMClient:
                     system_prompt,
                     user_prompt,
                 )
+            except AuthenticationError as exc:  # pragma: no cover - external service
+                raise CamelLLMError(
+                    "OpenAI authentication failed. Verify the OPENAI_API_KEY environment variable."
+                ) from exc
             except Exception as exc:  # pragma: no cover - depends on provider setup
                 last_error = exc
                 log.debug(

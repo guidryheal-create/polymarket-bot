@@ -3,6 +3,8 @@ CAMEL Memory Manager
 
 Wraps CAMEL's LongtermAgentMemory with Qdrant storage and Redis chat history.
 """
+from __future__ import annotations
+
 from typing import Optional, List, Dict, Any
 from core.config import settings
 from core.logging import log
@@ -34,7 +36,7 @@ class CamelMemoryManager:
         self,
         agent_id: str,
         collection_name: Optional[str] = None,
-        model_type: Optional[ModelType] = None
+        model_type: Optional["ModelType"] = None  # String annotation for forward reference
     ):
         """
         Initialize CAMEL memory manager.
@@ -139,19 +141,113 @@ class CamelMemoryManager:
             else:
                 role = OpenAIBackendRole.USER
         
-        record = MemoryRecord(
-            message=message,
-            role_at_backend=role,
-            extra_info=extra_info or {}
-        )
-        self.memory.write_records([record])
+        # ✅ Validate message content before storing (prevent empty vector errors)
+        message_content = getattr(message, 'content', '') or ''
+        if not message_content or len(message_content.strip()) == 0:
+            log.warning(f"Skipping memory write for empty message (role: {role}, agent_id: {self.agent_id})")
+            return  # Skip storing empty messages to prevent vector dimension errors
+        
+        # ✅ Additional validation: ensure content is not just whitespace or special chars
+        if not message_content.strip() or len(message_content.strip()) < 3:
+            log.warning(f"Skipping memory write for message with insufficient content (length: {len(message_content)}, agent_id: {self.agent_id})")
+            return
+        
+        try:
+            # ✅ Additional validation: ensure content can be embedded (not just special chars)
+            # Remove any control characters that might cause embedding issues
+            import re
+            cleaned_content = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', message_content)
+            
+            # ✅ Ensure minimum content length for valid embeddings
+            # CAMEL embeddings require meaningful content to generate proper vectors
+            min_content_length = 3
+            if not cleaned_content or len(cleaned_content.strip()) < min_content_length:
+                log.warning(
+                    f"Skipping memory write for message with insufficient content "
+                    f"(length: {len(cleaned_content) if cleaned_content else 0}, "
+                    f"min: {min_content_length}, agent_id: {self.agent_id})"
+                )
+                return
+            
+            # ✅ Validate that message has valid content attribute before creating record
+            # This prevents shape errors when CAMEL tries to embed empty messages
+            if not hasattr(message, 'content') or not message.content:
+                log.warning(f"Skipping memory write: message has no content attribute (agent_id: {self.agent_id})")
+                return
+            
+            record = MemoryRecord(
+                message=message,
+                role_at_backend=role,
+                extra_info=extra_info or {}
+            )
+            
+            # ✅ Write with error handling for vector dimension issues
+            try:
+                self.memory.write_records([record])
+            except (ValueError, TypeError) as embed_error:
+                # Check if it's a shape/dimension error
+                error_str = str(embed_error).lower()
+                if "shape" in error_str or "dimension" in error_str or "broadcast" in error_str or "aligned" in error_str:
+                    log.warning(
+                        f"Vector dimension/shape error when storing memory record: {embed_error}. "
+                        f"Message content: '{message_content[:100]}...' (length: {len(message_content)}). "
+                        f"Agent: {self.agent_id}. Skipping record."
+                    )
+                    return  # Skip this record to prevent shape mismatches
+                raise  # Re-raise if it's a different error
+        except ValueError as e:
+            # ✅ Handle vector dimension errors gracefully
+            if "could not broadcast" in str(e) or "shape" in str(e) or "broadcast" in str(e).lower():
+                log.warning(f"Vector dimension error when storing memory record: {e}. Message content length: {len(message_content)}, agent_id: {self.agent_id}")
+                # Skip this record - likely empty or invalid content
+                return
+            else:
+                raise
+        except Exception as e:
+            log.error(f"Failed to write memory record: {e}", exc_info=True)
     
     def write_records(
         self,
         records: List[MemoryRecord]
     ):
-        """Write multiple memory records."""
-        self.memory.write_records(records)
+        """Write multiple memory records with error handling."""
+        # ✅ Filter out empty messages before storing to prevent vector dimension errors
+        valid_records = []
+        for record in records:
+            try:
+                message = getattr(record, 'message', None)
+                if message:
+                    message_content = getattr(message, 'content', '') or ''
+                    if message_content and len(message_content.strip()) > 0:
+                        valid_records.append(record)
+                    else:
+                        log.debug(f"Skipping empty message record for memory storage")
+                else:
+                    log.warning(f"MemoryRecord has no message attribute, skipping")
+            except Exception as e:
+                log.warning(f"Error validating memory record: {e}, skipping")
+                continue
+        
+        if not valid_records:
+            log.debug("No valid records to store in memory")
+            return
+        
+        try:
+            self.memory.write_records(valid_records)
+        except (ValueError, TypeError) as e:
+            # ✅ Handle vector dimension errors gracefully
+            error_str = str(e)
+            if "could not broadcast" in error_str or "shape" in error_str:
+                log.warning(f"Vector dimension error when storing memory records: {e}. Skipping storage.")
+                # Don't re-raise - this is a known issue with empty vectors in CAMEL
+                return
+            else:
+                # Re-raise other errors
+                raise
+        except Exception as e:
+            # ✅ Log but don't fail on memory storage errors
+            log.warning(f"Error storing memory records (non-critical): {e}")
+            # Don't re-raise - memory storage failures shouldn't break the pipeline
     
     def get_context(self) -> tuple[List[BaseMessage], int]:
         """

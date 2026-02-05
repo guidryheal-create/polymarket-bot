@@ -83,11 +83,22 @@ if _models_py_path.exists():
     TrendAssessment = getattr(_models_py, 'TrendAssessment', None)
     FactInsight = getattr(_models_py, 'FactInsight', None)
     FusionRecommendation = getattr(_models_py, 'FusionRecommendation', None)
+    FusionResponseFormat = getattr(_models_py, 'FusionResponseFormat', None)
+    TrendTableEntry = getattr(_models_py, 'TrendTableEntry', None)
+    AgentReportComponent = getattr(_models_py, 'AgentReportComponent', None)
+    FusionReportDetail = getattr(_models_py, 'FusionReportDetail', None)
+    DetailedReportPayload = getattr(_models_py, 'DetailedReportPayload', None)
     # ExchangeType is in exchange_interface, not models.py
     try:
         from core.exchange_interface import ExchangeType
     except ImportError:
         ExchangeType = None
+    # StrategyMode is in models/strategy.py
+    try:
+        from core.models.strategy import StrategyMode, get_strategy_config
+    except ImportError:
+        StrategyMode = None
+        get_strategy_config = None
 else:
     # Fallback: raise error if models.py not found
     raise ImportError(f"Could not find models.py at {_models_py_path}")
@@ -138,4 +149,18 @@ if 'FactInsight' in globals() and FactInsight is not None:
     __all__.append("FactInsight")
 if 'FusionRecommendation' in globals() and FusionRecommendation is not None:
     __all__.append("FusionRecommendation")
+if 'FusionResponseFormat' in globals() and FusionResponseFormat is not None:
+    __all__.append("FusionResponseFormat")
+if 'TrendTableEntry' in globals() and TrendTableEntry is not None:
+    __all__.append("TrendTableEntry")
+if 'AgentReportComponent' in globals() and AgentReportComponent is not None:
+    __all__.append("AgentReportComponent")
+if 'FusionReportDetail' in globals() and FusionReportDetail is not None:
+    __all__.append("FusionReportDetail")
+if 'DetailedReportPayload' in globals() and DetailedReportPayload is not None:
+    __all__.append("DetailedReportPayload")
+if 'StrategyMode' in globals() and StrategyMode is not None:
+    __all__.append("StrategyMode")
+if 'get_strategy_config' in globals() and get_strategy_config is not None:
+    __all__.append("get_strategy_config")
 

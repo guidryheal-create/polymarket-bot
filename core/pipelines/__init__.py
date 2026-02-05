@@ -1,36 +1,16 @@
-"""Shared pipeline utilities for agentic orchestration."""
+"""
+Core pipelines module - Pure CAMEL only.
+"""
+from __future__ import annotations
 
-from .storage import (
-    get_trend_assessment,
-    set_trend_assessment,
-    get_fact_insight,
-    set_fact_insight,
-    get_fusion_recommendation,
-    set_fusion_recommendation,
-    pipeline_interval_to_seconds,
-    get_pipeline_live_entry,
-)
-from .trend_pipeline import TrendPipeline
-from .fact_pipeline import FactPipeline
-from .fusion_pipeline import FusionEngine, FusionInputs
-from .review_pipeline import WeightReviewPipeline, get_cached_weights
-from .prune_pipeline import MemoryPruningPipeline
+from .daily_process import DailyProcess
+try:
+    from .hourly_process import HourlyProcess  # type: ignore
+except Exception:  # pragma: no cover
+    HourlyProcess = None  # type: ignore
+try:
+    from .minute_process import MinuteProcess  # type: ignore
+except Exception:  # pragma: no cover
+    MinuteProcess = None  # type: ignore
 
-__all__ = [
-    "TrendPipeline",
-    "FactPipeline",
-    "FusionEngine",
-    "FusionInputs",
-    "WeightReviewPipeline",
-    "MemoryPruningPipeline",
-    "get_cached_weights",
-    "get_trend_assessment",
-    "set_trend_assessment",
-    "get_fact_insight",
-    "set_fact_insight",
-    "get_fusion_recommendation",
-    "set_fusion_recommendation",
-    "pipeline_interval_to_seconds",
-    "get_pipeline_live_entry",
-]
-
+__all__ = ["DailyProcess", "HourlyProcess", "MinuteProcess"]

@@ -1,7 +1,8 @@
 """
 CAMEL-compatible tools for trading system operations.
 """
-from core.camel_tools.mcp_forecasting_toolkit import MCPForecastingToolkit
+from core.camel_tools.api_forecasting_toolkit import APIForecastingToolkit
+from core.camel_tools.polymarket_toolkit import EnhancedPolymarketToolkit, PolymarketToolkit
 from core.camel_tools.blockscout_toolkit import BlockscoutMCPToolkit, get_blockscout_toolkit
 from core.camel_tools.dex_trading_toolkit import DEXTradingToolkit
 from core.camel_tools.market_data_toolkit import MarketDataToolkit
@@ -20,7 +21,9 @@ except ImportError:  # pragma: no cover
     GoogleResearchToolkit = None  # type: ignore
 
 __all__ = [
-    "MCPForecastingToolkit",
+    "APIForecastingToolkit",
+        "EnhancedPolymarketToolkit",
+        "PolymarketToolkit",
     "BlockscoutMCPToolkit",
     "get_blockscout_toolkit",
     "DEXTradingToolkit",

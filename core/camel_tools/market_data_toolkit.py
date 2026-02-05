@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional, Annotated
 from pydantic import Field
 from core.config import settings
 from core.logging import log
-from core.forecasting_client import ForecastingClient
+from core.clients.forecasting_client import ForecastingClient
 
 try:
     from camel.toolkits import FunctionTool  # type: ignore
@@ -46,21 +46,46 @@ class MarketDataToolkit:
         toolkit_instance = self
         
         async def get_ticker_info(
-            ticker: Annotated[str, Field(description="Stock ticker symbol (e.g., BTC-USD)")]
+            ticker: Annotated[str, Field(description="Stock ticker symbol (e.g., BTC-USD or BTC). DO NOT use 'PORTFOLIO' or 'portfolio' as a ticker - query individual tickers only.")]
         ) -> Dict[str, Any]:
             """
             Get detailed information about a specific ticker.
             
+            **CRITICAL**: This tool only works with individual ticker symbols (BTC, ETH, SOL, etc.).
+            DO NOT query 'PORTFOLIO' or 'portfolio' as a ticker - it will fail.
+            For portfolio-level analysis, aggregate data from individual tickers.
+            
             Args:
-                ticker: Stock ticker symbol
+                ticker: Stock ticker symbol (e.g., BTC, ETH, BTC-USD, ETH-USD)
                 
             Returns:
                 Ticker information including available intervals and metadata
             """
             try:
-                api_ticker = f"{ticker}-USD" if not ticker.endswith("-USD") else ticker
+                # ✅ CRITICAL: Reject invalid tickers like "PORTFOLIO" early
+                normalized = ticker.upper().replace("-USD", "").strip()
+                if not normalized or normalized in ["PORTFOLIO", "PORT", "ALL", "TOTAL"]:
+                    return {
+                        "success": False,
+                        "error": f"Invalid ticker symbol: '{ticker}'. This tool only works with individual ticker symbols (BTC, ETH, SOL, etc.). DO NOT query 'PORTFOLIO' as a ticker. For portfolio analysis, query individual tickers and aggregate the results.",
+                        "ticker": ticker,
+                        "info": {}
+                    }
                 
-                result = await toolkit_instance.forecasting_client.get_ticker_info(api_ticker)
+                api_ticker = f"{normalized}-USD"
+                # ✅ CRITICAL: Handle event loop closure errors gracefully
+                try:
+                    result = await toolkit_instance.forecasting_client.get_ticker_info(api_ticker)
+                except RuntimeError as loop_error:
+                    if "Event loop is closed" in str(loop_error):
+                        log.error(f"[MarketDataToolkit] Event loop closed during get_ticker_info for {ticker}")
+                        return {
+                            "success": False,
+                            "error": "Event loop closed during request. This may happen during concurrent operations. Please retry.",
+                            "ticker": ticker,
+                            "info": {}
+                        }
+                    raise
                 
                 return {
                     "success": True,
@@ -68,10 +93,19 @@ class MarketDataToolkit:
                     "info": result
                 }
             except Exception as e:
+                error_msg = str(e)
+                # Provide helpful error message for common mistakes
+                if "PORTFOLIO" in error_msg.upper() or "not found" in error_msg.lower():
+                    return {
+                        "success": False,
+                        "error": f"Ticker '{ticker}' not found. This tool only works with individual ticker symbols (BTC, ETH, SOL, etc.). DO NOT query 'PORTFOLIO' as a ticker. For portfolio analysis, query individual tickers (BTC, ETH, etc.) and aggregate the results.",
+                        "ticker": ticker,
+                        "info": {}
+                    }
                 log.error(f"Error getting ticker info: {e}")
                 return {
                     "success": False,
-                    "error": str(e),
+                    "error": f"Failed to get ticker info: {e}",
                     "ticker": ticker,
                     "info": {}
                 }
@@ -80,55 +114,19 @@ class MarketDataToolkit:
         get_ticker_info.__doc__ = "Get detailed information about a ticker including available intervals"
         return get_ticker_info
     
-    def get_available_intervals_tool(self):
-        """Get tool for listing available intervals."""
-        if not CAMEL_TOOLS_AVAILABLE:
-            raise ImportError("CAMEL tools not installed")
-        
-        toolkit_instance = self
-        
-        async def get_available_intervals() -> Dict[str, Any]:
-            """
-            Get list of all available time intervals.
-            
-            Returns:
-                List of available intervals
-            """
-            try:
-                intervals = await toolkit_instance.forecasting_client.get_available_intervals()
-                
-                return {
-                    "success": True,
-                    "intervals": intervals,
-                    "count": len(intervals)
-                }
-            except Exception as e:
-                log.error(f"Error getting available intervals: {e}")
-                return {
-                    "success": False,
-                    "error": str(e),
-                    "intervals": [],
-                    "count": 0
-                }
-        
-        get_available_intervals.__name__ = "get_available_intervals"
-        get_available_intervals.__doc__ = "Get list of all available time intervals for forecasting"
-        return get_available_intervals
-    
     def get_all_tools(self) -> List:
         """Get all tools in this toolkit."""
-        base_tools = [
-            self.get_ticker_info_tool(),
-            self.get_available_intervals_tool(),
-        ]
-        return [self._wrap_tool(func) for func in base_tools]
+        # No tools are exposed at the moment since the lightweight interval tool was removed.
+        return []
 
     @staticmethod
     def _wrap_tool(func):
         if not CAMEL_TOOLS_AVAILABLE or FunctionTool is None:
             raise ImportError("CAMEL function tools not installed")
 
-        tool = FunctionTool(func)
+        # ✅ PURE CAMEL: Use shared async wrapper for proper event loop handling
+        from core.camel_tools.async_wrapper import create_function_tool
+        tool = create_function_tool(func)
         try:
             schema = dict(tool.get_openai_tool_schema())
         except Exception:
