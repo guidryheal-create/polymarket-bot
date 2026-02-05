@@ -1,236 +1,89 @@
-# Guide de Démarrage Rapide
+# Quickstart Guide
 
-Ce guide vous permet de démarrer le système de trading agentique en quelques minutes.
+This guide will walk you through the steps to get the Agentic Trading System up and running on your local machine.
 
-## Prérequis
+## Prerequisites
 
-- **Docker** et **Docker Compose** installés
-- Au moins **4 GB de RAM** disponible
-- **Ports disponibles** : 8000, 8001, 3000, 5432, 6379, 9090
+Before you begin, ensure you have the following installed:
 
-## Installation en 3 Étapes
+*   **Python 3.11**
+*   **Pip** (Python package installer)
+*   **Docker** and **Docker Compose** (for the Docker-based setup)
+*   **Git**
 
-### 1. Configuration
+## Installation
 
-Copiez le fichier d'environnement et configurez vos clés API :
+You can either install the project locally or use the provided Docker setup.
 
-```bash
-cp .env.example .env
-nano .env  # ou utilisez votre éditeur préféré
-```
+### Option 1: Local Installation
 
-**Variables importantes à configurer :**
+1.  **Clone the repository:**
 
-```env
-# API MCP pour les prédictions DQN
-MCP_API_URL=https://forecasting.guidry-cloud.com
+    ```bash
+    git clone https://github.com/your-username/agentic-system-trading.git
+    cd agentic-system-trading
+    ```
 
-# OpenAI API pour l'analyse de news (optionnel)
-OPENAI_API_KEY=your_openai_key_here
+2.  **Create a virtual environment:**
 
-# VLLM endpoint pour LLM local (optionnel, alternative à OpenAI)
-VLLM_ENDPOINT=http://your-vllm-server:8000/v1
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    ```
 
-# RPC URLs pour les blockchains (pour le copy trading)
-ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/your_key
-BSC_RPC_URL=https://bsc-dataseed.binance.org/
-```
+3.  **Install the dependencies:**
 
-### 2. Démarrage
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-Lancez tous les services avec le script de démarrage :
+### Option 2: Docker Installation
 
-```bash
-./start.sh
-```
+1.  **Clone the repository:**
 
-Ou manuellement avec Docker Compose :
+    ```bash
+    git clone https://github.com/your-username/agentic-system-trading.git
+    cd agentic-system-trading
+    ```
 
-```bash
-docker-compose up --build -d
-```
+2.  **Build and start the Docker containers:**
 
-### 3. Vérification
+    ```bash
+    docker compose up --build
+    ```
 
-Vérifiez que tous les services sont opérationnels :
+    This will build the `polymarket-bot` image and start all the services defined in the `docker-compose.yml` file, including Redis, Qdrant, Ollama, and Neo4j.
 
-```bash
-docker-compose ps
-```
+## Configuration
 
-Vous devriez voir tous les services avec le statut `Up`.
+1.  **Create a `.env` file:**
 
-## Accès aux Interfaces
+    Copy the `env.example` file to a new file named `.env`:
 
-Une fois les services démarrés, vous pouvez accéder à :
+    ```bash
+    cp env.example .env
+    ```
 
-| Service | URL | Description |
-| :--- | :--- | :--- |
-| **API Docs** | [http://localhost:8000/docs](http://localhost:8000/docs) | Documentation Swagger de l'API |
-| **API Health** | [http://localhost:8000/health](http://localhost:8000/health) | Vérification de l'état du système |
-| **Grafana** | [http://localhost:3000](http://localhost:3000) | Dashboards de monitoring |
-| **Prometheus** | [http://localhost:9090](http://localhost:9090) | Métriques système |
-| **DEX Simulator** | [http://localhost:8001](http://localhost:8001) | Interface du simulateur DEX |
+2.  **Edit the `.env` file:**
 
-**Identifiants Grafana par défaut :**
-- Username: `admin`
-- Password: `admin_change_in_prod`
+    Open the `.env` file and fill in the required environment variables. This includes API keys for various services, your Polygon private key and address, and other configuration options.
 
-## Test Rapide
+    **Important:** Do not commit your `.env` file to version control.
 
-### Via l'API
+## Running the Application
 
-Vérifiez l'état du portfolio :
+### Local
+
+If you installed the project locally, you can start the FastAPI server with the following command:
 
 ```bash
-curl http://localhost:8000/api/portfolio
+uvicorn api.main_polymarket:app --reload
 ```
 
-Obtenez les performances :
+### Docker
 
-```bash
-curl http://localhost:8000/api/performance
-```
+If you are using the Docker setup, the application will be started automatically when you run `docker compose up`.
 
-Consultez les signaux pour BTC :
+## Accessing the API
 
-```bash
-curl http://localhost:8000/api/signals/BTC
-```
-
-### Via le Script de Test
-
-Exécutez les tests manuels pour valider chaque agent :
-
-```bash
-python3.11 test_manual.py
-```
-
-## Commandes Utiles
-
-### Voir les logs
-
-```bash
-# Tous les services
-docker-compose logs -f
-
-# Un service spécifique
-docker-compose logs -f orchestrator-agent
-docker-compose logs -f dqn-agent
-```
-
-### Redémarrer un agent
-
-```bash
-docker-compose restart dqn-agent
-```
-
-### Arrêter le système
-
-```bash
-docker-compose down
-```
-
-### Arrêter et supprimer les volumes
-
-```bash
-docker-compose down -v
-```
-
-## Architecture des Agents
-
-Le système est composé de 7 agents indépendants :
-
-| Agent | Cycle | Rôle |
-| :--- | :--- | :--- |
-| **Orchestrator** | 5 min | Coordonne tous les agents et prend les décisions finales |
-| **DQN Agent** | 5 min | Obtient les prédictions de l'API MCP |
-| **Chart Agent** | 5 min | Analyse technique (RSI, MACD, Bollinger) |
-| **Risk Agent** | 2 min | Évalue les risques et valide les trades |
-| **Memory Agent** | 10 min | Maintient l'historique et calcule les métriques |
-| **News Agent** | 15 min | Analyse le sentiment des actualités crypto |
-| **CopyTrade Agent** | 3 min | Surveille les transactions on-chain |
-
-## Validation Humaine
-
-Pour les trades importants ou risqués, le système peut demander une validation humaine.
-
-### Consulter les validations en attente
-
-```bash
-curl http://localhost:8000/api/validations/pending
-```
-
-### Approuver un trade
-
-```bash
-curl -X POST http://localhost:8000/api/validations/{request_id}/respond \
-  -H "Content-Type: application/json" \
-  -d '{
-    "request_id": "xxx",
-    "approved": true,
-    "feedback": "Approved after manual review"
-  }'
-```
-
-## Ajouter un Wallet à Suivre
-
-Pour activer le copy trading d'un wallet performant :
-
-```bash
-curl -X POST http://localhost:8000/api/wallets/track \
-  -H "Content-Type: application/json" \
-  -d '{
-    "address": "0x...",
-    "blockchain": "ETH"
-  }'
-```
-
-## Dépannage
-
-### Les agents ne démarrent pas
-
-Vérifiez les logs pour identifier l'erreur :
-
-```bash
-docker-compose logs orchestrator-agent
-```
-
-### Erreur de connexion Redis
-
-Vérifiez que Redis est bien démarré :
-
-```bash
-docker-compose ps redis
-docker-compose logs redis
-```
-
-### Erreur de connexion PostgreSQL
-
-Vérifiez que PostgreSQL est bien démarré et initialisé :
-
-```bash
-docker-compose ps postgres
-docker-compose logs postgres
-```
-
-### L'API MCP ne répond pas
-
-Vérifiez votre `MCP_API_URL` dans le fichier `.env` et assurez-vous que l'API est accessible.
-
-## Prochaines Étapes
-
-1. **Configurez Grafana** : Importez les dashboards pré-configurés pour visualiser les performances
-2. **Ajustez les paramètres** : Modifiez `core/config.py` selon vos besoins (capital, limites, intervalles)
-3. **Ajoutez des wallets** : Configurez le copy trading avec des wallets performants
-4. **Activez les alertes** : Configurez les notifications pour les événements importants
-5. **Passez en production** : Déployez sur Docker Swarm ou Kubernetes
-
-## Support
-
-Pour toute question ou problème, consultez :
-
-- **Documentation complète** : `README.md`
-- **Architecture détaillée** : `system_analysis.md`
-- **Tests** : `tests/` et `test_manual.py`
-
+Once the application is running, you can access the API at `http://localhost:8000`. The API documentation is available at `http://localhost:8000/docs`.
