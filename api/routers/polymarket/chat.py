@@ -45,17 +45,36 @@ async def chat_with_agent(chat_request: ChatRequest) -> ChatResponse:
         society = TradingWorkforceSociety()
         workforce = await society.build()
         task = Task(
-            description=(
+            content=(
                 "You are a Polymarket assistant. Answer the user briefly and clearly.\n\n"
                 f"User message: {message}\n"
                 f"Context ID: {context_id}\n"
-            ),
-            expected_output="Short helpful response to the user.",
+            )
         )
-        if hasattr(workforce, "execute_task"):
-            result = await workforce.execute_task(task)
-        else:
-            result = await workforce.process(task)
+
+        result = await workforce.process_task(task)
+        # workforce.get_workforce_log_tree() # Returns an ASCII tree representation of the task hierarchy and worker status.
+        # workforce.get_pending_tasks() # Get current pending tasks for human review.
+        # workforce.get_completed_tasks() # Get completed tasks.
+        # workforce.get_workforce_kpis() # Returns a dictionary of key performance indicators.
+        # workforce.to_mcp() 
+        """
+        def to_mcp(
+            name: str = "CAMEL-Workforce",
+            description: str = "A workforce system using the CAM" "multi-agent collaboration.",
+            dependencies: List[str] | None = None,
+            host: str = "localhost",
+            port: int = 8001
+        ) -> FastMCP[Any]
+        Expose this Workforce as an MCP server.
+
+        Args
+        name : str
+        Name of the MCP server. (default: CAMEL-Workforce)
+        """
+        #workforce.stop_gracefully() # Request workforce to finish current in-flight work then halt.
+
+
 
         if isinstance(result, dict):
             response_text = result.get("response") or result.get("answer") or result.get("content") or response_text

@@ -24,12 +24,11 @@
     <div class="muted">Active Flux</div>
     <div class="tag" id="workforce-flux">Loading...</div>
     <div style="margin-top:12px;" class="input-row">
-      <button id="btn-start-flux" class="btn-success">Start Flux</button>
-      <button id="btn-stop-flux" class="btn-danger">Stop Flux</button>
+      <button id="btn-start-flux" class="btn-success">Start RSS Flux</button>
+      <button id="btn-stop-flux" class="btn-danger">Stop RSS Flux</button>
+      <button id="btn-trigger-flux" class="btn-trigger">Trigger RSS Flux</button>
       <button id="btn-refresh-dashboard" class="btn-secondary">Refresh</button>
     </div>
-    <div class="muted" style="margin-top: 10px;">Trigger Type</div>
-    <div class="tag warn" id="workforce-trigger">n/a</div>
   </div>
   <div class="card">
     <h3>Latest Decisions</h3>
@@ -126,6 +125,7 @@
   document.getElementById('btn-export-results').addEventListener('click', window.ui.exportResultsCSV);
   document.getElementById('btn-start-flux').addEventListener('click', window.ui.startFlux);
   document.getElementById('btn-stop-flux').addEventListener('click', window.ui.stopFlux);
+  document.getElementById('btn-trigger-flux').addEventListener('click', window.ui.triggerWorkforce);
 
   // Periodic updates
   setInterval(() => {
@@ -133,4 +133,3 @@
   }, 15000);
 </script>
 {% endblock %}
-

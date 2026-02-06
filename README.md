@@ -17,10 +17,23 @@ The system is designed to be highly modular and extensible, allowing for the add
 *   **Modular Architecture**: Easily extend the system with new signal sources, trading strategies, and exchange integrations.
 *   **Real-time Monitoring**: A FastAPI backend provides an API for real-time monitoring of trading activity.
 *   **Comprehensive Testing**: A suite of unit and integration tests to ensure the reliability of the system.
+*   **Trigger Modes**: Manual and Interval triggers for RSS flux with configurable cadence and limits.
+*   **MCP Server**: Expose the workforce as an MCP server (default `localhost:8001`).
 
 ## Getting Started
 
 To get a local copy up and running, please follow the steps in the [QUICKSTART.md](QUICKSTART.md) file.
+
+## Trigger Modes
+
+*   **Manual**: Runs immediately on the latest feed and bypasses RSS cache thresholds and trade limit checks.
+*   **Interval**: Runs on a schedule (hours/days) and enforces RSS cache thresholds, verification, and limits.
+
+You can switch modes and set interval hours directly in the Workforce UI.
+
+## UI Defaults
+
+The UI uses `.env` values by default. If you leave the login API key blank, the backend falls back to `POLYMARKET_API_KEY` from `.env`.
 
 ## Project Status
 

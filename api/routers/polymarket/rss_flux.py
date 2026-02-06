@@ -10,8 +10,17 @@ Provides API endpoints to:
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
 
+# instead the flux is not Agentic except if specified.
+# use manual fetch and retreive then launch workforce for analysis and execution.
+# use the @polymarket_flux internal more complete process when the trigger condiction is reached
+# multiple trigger type : interval every N + limitation, RSS every new N + limitation + expire check, manual
+# limitations : max trades per day, max active positions, min confidence, etc.
+
 from core.pipelines.polymarket_rss_flux import RSSFluxConfig, PolymarketRSSFlux
+from core.camel_runtime.societies import TradingWorkforceSociety
+from core.clients.polymarket_client import PolymarketClient
 from core.logging import log
+from api.services.polymarket.logging_service import logging_service
 import asyncio
 
 router = APIRouter()
@@ -37,6 +46,21 @@ def get_rss_flux() -> PolymarketRSSFlux:
     return _rss_flux_instance
 
 
+async def ensure_rss_flux() -> PolymarketRSSFlux:
+    """Ensure RSS Flux instance is initialized for UI/API calls."""
+    global _rss_flux_instance
+    if _rss_flux_instance is None:
+        society = TradingWorkforceSociety()
+        workforce = await society.build()
+        _rss_flux_instance = PolymarketRSSFlux(
+            workforce=workforce,
+            api_client=PolymarketClient(),
+            config=RSSFluxConfig(),
+        )
+        log.info("[RSS FLUX API] Lazy-initialized RSS Flux instance")
+    return _rss_flux_instance
+
+
 # ============================================================================
 # Control Endpoints
 # ============================================================================
@@ -49,7 +73,7 @@ async def start_rss_flux() -> Dict[str, Any]:
     Returns:
         Status dict with flux configuration and initial state
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     
     if flux._running:
         return {
@@ -90,7 +114,7 @@ async def stop_rss_flux() -> Dict[str, Any]:
     Returns:
         Status dict confirming shutdown
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     
     if not flux._running:
         return {
@@ -115,26 +139,45 @@ async def stop_rss_flux() -> Dict[str, Any]:
 
 
 @router.post("/flux/trigger-scan")
-async def trigger_manual_scan(background_tasks: BackgroundTasks) -> Dict[str, Any]:
+async def trigger_manual_scan(
+    background_tasks: BackgroundTasks,
+    verify_positions: bool = Query(False),
+    start_if_stopped: bool = Query(False),
+) -> Dict[str, Any]:
     """Manually trigger a market batch processing cycle.
-    
+
     Runs the scan in a background task to avoid blocking the API response.
-    
+
+    Manual triggers bypass verification by default.
+
     Returns:
         Status dict with scan ID and configuration
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     
-    if not flux._running:
-        # Start the flux in background if not running
+    if not flux._running and start_if_stopped:
+        # Start the flux in background if requested
         background_tasks.add_task(flux.start)
     
     try:
         # Trigger scan in background
         scan_id = f"manual_scan_{int(__import__('time').time())}"
-        background_tasks.add_task(flux.process_market_batch)
+        background_tasks.add_task(
+            flux.process_market_batch,
+            trigger_type="manual",
+            verify_positions=verify_positions,
+        )
         
-        log.info("[RSS FLUX API] Manual scan triggered: %s", scan_id)
+        log.info(
+            "[RSS FLUX API] Manual scan triggered: %s (verify_positions=%s)",
+            scan_id,
+            verify_positions,
+        )
+        logging_service.log_event(
+            "INFO",
+            "RSS flux manual trigger",
+            {"scan_id": scan_id, "verify_positions": verify_positions},
+        )
         
         return {
             "status": "triggered",
@@ -143,6 +186,7 @@ async def trigger_manual_scan(background_tasks: BackgroundTasks) -> Dict[str, An
             "config": {
                 "batch_size": flux.config.batch_size,
                 "review_threshold": flux.config.review_threshold,
+                "verify_positions": verify_positions,
             },
         }
     except Exception as exc:
@@ -157,34 +201,37 @@ async def trigger_manual_scan(background_tasks: BackgroundTasks) -> Dict[str, An
 # Status & Configuration Endpoints
 # ============================================================================
 
-
 @router.get("/flux/status")
-async def get_flux_status() -> Dict[str, Any]:
-    """Get current RSS Flux status and metrics.
-    
-    Returns:
-        Status dict with running state, trades, positions, and configuration
+async def flux_status() -> Dict[str, Any]:
     """
-    flux = get_rss_flux()
-    status = flux.get_status()
-    
+    Flux status is scheduler + observable state.
+    """
+    try:
+        flux = await ensure_rss_flux()
+        status = flux.get_status()
+    except Exception:
+        return {
+            "status": "not_initialized",
+            "scheduler_running": False,
+            "trades_today": 0,
+            "active_positions": 0,
+            "cache_size": 0,
+            "workforce_attached": False,
+            "scan_in_progress": False,
+            "last_trigger_at": None,
+            "last_trigger_type": None,
+        }
+
     return {
-        "status": "running" if flux._running else "stopped",
-        "running": flux._running,
-        **status,
-        "positions": {
-            "active": len(flux._active_positions),
-            "details": [
-                {
-                    "position_id": pos_id,
-                    "market_id": pos_data.get("market_id"),
-                    "market_title": pos_data.get("market_title"),
-                    "entry_price": pos_data.get("entry_price"),
-                    "confidence": pos_data.get("confidence"),
-                }
-                for pos_id, pos_data in flux._active_positions.items()
-            ],
-        },
+        "status": "ok",
+        "scheduler_running": flux._running,
+        "trades_today": flux._trades_today,
+        "active_positions": len(flux._active_positions),
+        "cache_size": len(flux._feed_cache),
+        "workforce_attached": flux.workforce is not None,
+        "scan_in_progress": status.get("scan_in_progress"),
+        "last_trigger_at": status.get("last_trigger_at"),
+        "last_trigger_type": status.get("last_trigger_type"),
     }
 
 
@@ -195,7 +242,7 @@ async def get_flux_config() -> Dict[str, Any]:
     Returns:
         Configuration dict with all tunable parameters
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     config = flux.config
     
     return {
@@ -206,12 +253,17 @@ async def get_flux_config() -> Dict[str, Any]:
         "max_trades_per_day": config.max_trades_per_day,
         "min_confidence": config.min_confidence,
         "cache_path": config.cache_path,
+        "trigger_type": config.trigger_type,
+        "interval_hours": config.interval_hours,
     }
 
 
 @router.post("/flux/config")
 async def update_flux_config(
     scan_interval: Optional[int] = Query(None, ge=10, le=3600),
+    trigger_type: Optional[str] = Query(None),
+    interval_hours: Optional[int] = Query(None, ge=1, le=168),
+    interval_days: Optional[int] = Query(None, ge=1, le=30),
     batch_size: Optional[int] = Query(None, ge=1, le=100),
     review_threshold: Optional[int] = Query(None, ge=1, le=500),
     max_trades_per_day: Optional[int] = Query(None, ge=1, le=100),
@@ -232,13 +284,25 @@ async def update_flux_config(
     Returns:
         Updated configuration
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     config = flux.config
     
     # Update config values if provided
     if scan_interval is not None:
         config.scan_interval = scan_interval
         flux.scan_interval = scan_interval
+        flux.interval_hours = max(1, int(scan_interval / 3600))
+        config.interval_hours = flux.interval_hours
+    if interval_days is not None:
+        interval_hours = interval_days * 24
+    if interval_hours is not None:
+        config.interval_hours = interval_hours
+        flux.interval_hours = interval_hours
+        config.scan_interval = interval_hours * 3600
+        flux.scan_interval = config.scan_interval
+    if trigger_type is not None:
+        config.trigger_type = trigger_type
+        flux.trigger_type = trigger_type
     if batch_size is not None:
         config.batch_size = batch_size
         flux.batch_size = batch_size
@@ -269,6 +333,8 @@ async def update_flux_config(
             "max_cache": config.max_cache,
             "max_trades_per_day": config.max_trades_per_day,
             "min_confidence": config.min_confidence,
+            "trigger_type": config.trigger_type,
+            "interval_hours": config.interval_hours,
         },
     }
 
@@ -285,7 +351,7 @@ async def get_active_positions() -> Dict[str, Any]:
     Returns:
         Dict mapping position IDs to position details
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     positions = flux.get_active_positions()
     
     return {
@@ -304,7 +370,7 @@ async def get_position_details(position_id: str) -> Dict[str, Any]:
     Returns:
         Position details or 404 if not found
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     positions = flux.get_active_positions()
     
     if position_id not in positions:
@@ -326,7 +392,7 @@ async def get_flux_metrics() -> Dict[str, Any]:
     Returns:
         Metrics dict with trades, positions, and cache stats
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     status = flux.get_status()
     
     return {
@@ -348,8 +414,6 @@ async def get_flux_metrics() -> Dict[str, Any]:
 # ============================================================================
 # Health & Diagnostics
 # ============================================================================
-
-
 @router.get("/flux/health")
 async def flux_health_check() -> Dict[str, Any]:
     """Check RSS Flux service health.
@@ -357,7 +421,7 @@ async def flux_health_check() -> Dict[str, Any]:
     Returns:
         Health status with component information
     """
-    flux = get_rss_flux()
+    flux = await ensure_rss_flux()
     
     health = {
         "status": "healthy",

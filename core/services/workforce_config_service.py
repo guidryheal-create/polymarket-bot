@@ -353,6 +353,7 @@ class WorkforceConfigService:
         """Get current status vs. limits."""
         trades_today = self._get_trades_today()
         current_exposure = self._get_current_exposure()
+        open_positions_count = len(self.open_positions)
         
         return {
             "trades": {
@@ -366,7 +367,9 @@ class WorkforceConfigService:
                 "limit": self.trading_controls.max_exposure_total,
                 "remaining": self.trading_controls.max_exposure_total - current_exposure,
                 "pct_used": current_exposure / self.trading_controls.max_exposure_total * 100
-            }
+            },
+            "open_positions": open_positions_count,
+            "max_positions": None,
         }
     
     # =========================================================================

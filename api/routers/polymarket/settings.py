@@ -17,6 +17,9 @@ async def get_settings():
         config=config,
         ui={
             "polymarket_only": True,
+            "uses_env_defaults": True,
+            "flux_trigger_types": ["manual", "interval"],
+            "flux_default_interval_hours": config.get("trigger_config", {}).get("interval_hours", 4),
             "features": [
                 "market_search",
                 "market_details",

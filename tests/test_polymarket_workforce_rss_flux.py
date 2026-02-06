@@ -52,6 +52,8 @@ def rss_flux_config():
 def mock_workforce():
     """Create a mock CAMEL Workforce."""
     workforce = AsyncMock(spec=Workforce)
+    if hasattr(Workforce, "process_task_async"):
+        workforce.process_task_async = AsyncMock(return_value={"status": "completed"})
     workforce.process_task = AsyncMock(return_value={"status": "completed"})
     workforce.execute_task = AsyncMock(return_value={"status": "completed"})
     workforce.run = AsyncMock(return_value={"status": "completed"})
@@ -68,6 +70,7 @@ def mock_api_client():
     client.get_market_details = AsyncMock(return_value={})
     client.get_orderbook = AsyncMock(return_value={})
     client.execute_trade = AsyncMock(return_value={"status": "success"})
+    client.get_open_positions = AsyncMock(return_value={})
     return client
 
 
@@ -340,68 +343,30 @@ class TestDailyTradingLimits:
     """Test daily trading limit enforcement."""
 
     @pytest.mark.asyncio
-    async def test_trading_limit_blocks_trade(self, rss_flux_instance):
-        """Test that max_trades_per_day limit blocks trades."""
-        rss_flux_instance._trades_today = 3  # Set to max
-        rss_flux_instance._trade_day = datetime.now(timezone.utc).date()
+    async def test_trading_limit_disables_execution(self, rss_flux_instance):
+        """Execution should be disabled when daily limit is reached."""
+        rss_flux_instance._trades_today = rss_flux_instance.config.max_trades_per_day
 
-        analysis_result = {
-            "market_id": "market_1",
-            "market_title": "Test Market",
-            "decision": "BUY",
-            "confidence": 0.75,
-            "reasoning": "Test",
-        }
-
-        result = await rss_flux_instance._execute_trade(analysis_result)
-        assert result["status"] == "skipped"
-        assert "Daily trading limit reached" in result["reason"]
-
-    @pytest.mark.asyncio
-    async def test_confidence_threshold_blocks_trade(self, rss_flux_instance):
-        """Test that low confidence blocks trades."""
-        analysis_result = {
-            "market_id": "market_1",
-            "market_title": "Test Market",
-            "decision": "BUY",
-            "confidence": 0.50,  # Below min_confidence (0.65)
-            "reasoning": "Test",
-        }
-
-        result = await rss_flux_instance._execute_trade(analysis_result)
-        assert result["status"] == "skipped"
-        assert "Confidence below threshold" in result["reason"]
-
-    @pytest.mark.asyncio
-    async def test_daily_limit_resets_next_day(self, rss_flux_instance):
-        """Test that daily trade count resets on new day."""
-        rss_flux_instance._trades_today = 3
-        yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
-        rss_flux_instance._trade_day = yesterday
-
-        # Trigger trade execution (will reset count due to date change)
-        analysis_result = {
-            "market_id": "market_1",
-            "market_title": "Test Market",
-            "decision": "BUY",
-            "confidence": 0.75,
-            "reasoning": "Test",
-        }
-
-        # Mock the task execution to succeed
-        rss_flux_instance.workforce.process_task = AsyncMock(
-            return_value={
-                "status": "completed",
-                "position_id": "pos_1",
-                "entry_price": 0.5,
-                "position_size": 0.1,
-            }
+        result = await rss_flux_instance._run_batch_task(
+            [{"id": "market_1", "title": "Test Market"}],
+            trigger_type="interval",
+            enforce_limits=True,
         )
 
-        result = await rss_flux_instance._execute_trade(analysis_result)
-        # Should proceed since count was reset
-        assert rss_flux_instance._trades_today >= 1
-        assert rss_flux_instance._trade_day == datetime.now(timezone.utc).date()
+        assert result["execution_enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_manual_allows_execution(self, rss_flux_instance):
+        """Manual trigger bypasses limits."""
+        rss_flux_instance._trades_today = rss_flux_instance.config.max_trades_per_day
+
+        result = await rss_flux_instance._run_batch_task(
+            [{"id": "market_1", "title": "Test Market"}],
+            trigger_type="manual",
+            enforce_limits=False,
+        )
+
+        assert result["execution_enabled"] is True
 
 
 class TestCacheManagement:
@@ -478,14 +443,17 @@ class TestWorkforceTaskExecution:
     """Test workforce task execution."""
 
     @pytest.mark.asyncio
-    async def test_execute_task_uses_process_task(self, rss_flux_instance):
-        """Test that _execute_task uses workforce.process_task when available."""
+    async def test_execute_task_uses_process_task_async(self, rss_flux_instance):
+        """Test that _execute_task uses workforce.process_task_async when available."""
+        if not hasattr(Workforce, "process_task_async"):
+            pytest.skip("Workforce does not support process_task_async")
         task = Task(content="Test task")
 
-        # Create a brand new mock with only process_task
+        # Create a brand new mock with only process_task_async
         mock_workforce = AsyncMock()
-        mock_workforce.process_task = AsyncMock(return_value={"status": "completed", "result": "success"})
-        # Remove other methods to ensure process_task is used
+        mock_workforce.process_task_async = AsyncMock(return_value={"status": "completed", "result": "success"})
+        # Remove other methods to ensure process_task_async is used
+        del mock_workforce.process_task
         del mock_workforce.execute_task
         del mock_workforce.run
         
@@ -493,7 +461,7 @@ class TestWorkforceTaskExecution:
 
         result = await rss_flux_instance._execute_task(task, "test_task")
 
-        mock_workforce.process_task.assert_called_once_with(task)
+        mock_workforce.process_task_async.assert_called_once_with(task)
         assert result["status"] == "completed"
 
     @pytest.mark.asyncio
@@ -504,6 +472,8 @@ class TestWorkforceTaskExecution:
         # Create a mock with only execute_task
         mock_workforce = AsyncMock()
         mock_workforce.execute_task = AsyncMock(return_value={"status": "completed"})
+        if hasattr(mock_workforce, "process_task_async"):
+            del mock_workforce.process_task_async
         del mock_workforce.process_task
         del mock_workforce.run
         
@@ -521,6 +491,8 @@ class TestWorkforceTaskExecution:
 
         # Create a mock that raises an exception
         mock_workforce = AsyncMock()
+        if hasattr(mock_workforce, "process_task_async"):
+            del mock_workforce.process_task_async
         mock_workforce.process_task = AsyncMock(side_effect=Exception("Test error"))
         
         rss_flux_instance.workforce = mock_workforce
@@ -624,18 +596,27 @@ class TestRSSFluxIntegration:
     @pytest.mark.asyncio
     async def test_process_market_batch_returns_summary(self, rss_flux_instance):
         """Test that process_market_batch returns a summary."""
-        # Mock workforce to return empty markets initially  
-        rss_flux_instance.workforce.process_task = AsyncMock(
-            return_value={
-                "status": "completed",
-                "markets": [],
-            }
+        rss_flux_instance.api_client.search_markets = AsyncMock(
+            return_value=[{"id": "market_1", "title": "Test Market"}]
         )
-
         result = await rss_flux_instance.process_market_batch()
 
         assert "batch_id" in result
         assert result.get("batch_id") is not None
+
+    @pytest.mark.asyncio
+    async def test_manual_trigger_matches_api_flow(self, rss_flux_instance):
+        """Manual trigger should mirror API behavior (manual + verify bypass)."""
+        rss_flux_instance.workforce.process_task = AsyncMock(
+            return_value={"status": "completed", "markets": []}
+        )
+
+        result = await rss_flux_instance.process_market_batch(
+            trigger_type="manual",
+            verify_positions=False,
+        )
+
+        assert result.get("trigger_type") == "manual"
 
     @pytest.mark.asyncio
     async def test_get_active_positions(self, rss_flux_instance):

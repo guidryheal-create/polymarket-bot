@@ -30,6 +30,7 @@ try:
         TradeParams,
         OrderScoringParams,
     )
+    from py_clob_client.endpoints import ORDERS
     from py_clob_client.order_builder.constants import BUY, SELL
     from py_clob_client.constants import AMOY
     CLOB_CLIENT_AVAILABLE = True
@@ -44,6 +45,7 @@ except ImportError:
     AMOY = 80002
     BUY = "BUY"
     SELL = "SELL"
+    ORDERS = "/orders"
     CLOB_CLIENT_AVAILABLE = False
 
 
@@ -633,3 +635,67 @@ class PolymarketClient:
         except Exception as e:
             log.error(f"Failed to get order: {e}")
             raise
+
+    # Additional methods for authenticated trading can be added here (e.g., modify_order, get_position, etc.)
+    def get_open_positions(self) -> Dict[str, Any]:
+        """Get open positions (authenticated or readonly CLOB access).
+
+        Returns:
+            Dict mapping market_id -> list of open orders/positions.
+        """
+        try:
+            # Prefer authenticated client if available
+            if self.is_authenticated:
+                orders = self._clob_client.get_orders()
+            else:
+                host = self.host or os.getenv("CLOB_API_URL", "https://clob.polymarket.com")
+                address = self.polygon_address or os.getenv(
+                    "POLY_ADDRESS",
+                    "0xc68576124eC1fF645F81a560E14003C8deF2e8fb",
+                )
+                readonly_api_key = os.getenv("CLOB_READONLY_API_KEY")
+                if not readonly_api_key or not address:
+                    log.warning(
+                        "Readonly CLOB access not configured (missing CLOB_READONLY_API_KEY or address)."
+                    )
+                    return {}
+
+                response = httpx.get(
+                    f"{host}{ORDERS}",
+                    headers={
+                        "POLY_READONLY_API_KEY": readonly_api_key,
+                        "POLY_ADDRESS": address,
+                        "Content-Type": "application/json",
+                    },
+                    params={"maker_address": address},
+                    follow_redirects=True,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                orders = response.json()
+
+            if isinstance(orders, dict) and "data" in orders and isinstance(orders["data"], list):
+                orders = orders["data"]
+            if not isinstance(orders, list):
+                log.warning("Unexpected open orders response format: %s", type(orders).__name__)
+                return {}
+
+            positions_by_market: Dict[str, List[Dict[str, Any]]] = {}
+            for order in orders:
+                market_id = order.get("market") or order.get("market_id")
+                if not market_id:
+                    continue
+                positions_by_market.setdefault(str(market_id), []).append(order)
+
+            log.debug("Retrieved %d markets with open positions", len(positions_by_market))
+            return positions_by_market
+        except Exception as exc:
+            log.error(f"Failed to get open positions: {exc}")
+            return {}
+
+    def get_open_position(self, market_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Get open positions for a single market_id."""
+        if not market_id:
+            return None
+        positions = self.get_open_positions()
+        return positions.get(str(market_id))

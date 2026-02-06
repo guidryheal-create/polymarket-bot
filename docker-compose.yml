@@ -129,6 +129,7 @@ services:
       - .env
     ports:
       - "8000:8000"
+      - "8001:8001"
     environment:
       # Core Services
       - REDIS_HOST=redis
@@ -165,6 +166,8 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - CLOB_READONLY_API_KEY=${CLOB_READONLY_API_KEY:-}
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY:-}
       - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/password}
       - FORECASTING_MODE=${FORECASTING_MODE:-disabled}
 

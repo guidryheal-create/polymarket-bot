@@ -7,13 +7,15 @@
       <label>Trigger Type</label>
       <select id="trigger-type-select" onchange="window.ui.changeTriggerType()">
         <option value="manual">Manual</option>
-        <option value="scheduled">Scheduled</option>
-        <option value="event-driven">Event Driven</option>
-        <option value="rss-feed">RSS Feed</option>
+        <option value="interval">Interval</option>
       </select>
     </div>
+    <div class="form-group">
+      <label>Interval (hours)</label>
+      <input id="trigger-interval-hours" type="number" min="1" max="168" value="4" />
+    </div>
     <div style="margin-top: 12px;">
-      <button id="trigger-wf" onclick="window.ui.triggerWorkforce()" class="btn-trigger">Trigger Workforce</button>
+      <button id="trigger-wf" onclick="window.ui.triggerWorkforce()" class="btn-trigger">Trigger RSS Flux</button>
     </div>
     <div class="result-box" id="wf-trigger-result" style="margin-top: 10px; display: none;"></div>
   </div>
@@ -25,6 +27,29 @@
       <button id="btn-stop-flux" onclick="window.ui.stopFlux()" class="btn-danger">Stop Flux</button>
       <button onclick="window.ui.loadWorkforce()" class="btn-secondary">Refresh Status</button>
     </div>
+  </div>
+</section>
+
+<section class="grid two" style="margin-top: 16px;">
+  <div class="card">
+    <h3>MCP Server</h3>
+    <div class="form-group">
+      <label>Server Name</label>
+      <input id="mcp-name" type="text" value="CAMEL-Workforce" />
+    </div>
+    <div class="form-group">
+      <label>Host</label>
+      <input id="mcp-host" type="text" value="localhost" />
+    </div>
+    <div class="form-group">
+      <label>Port</label>
+      <input id="mcp-port" type="number" value="8001" min="1" max="65535" />
+    </div>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+      <button id="btn-start-mcp" onclick="window.ui.startMcp()" class="btn-secondary">Start MCP</button>
+      <button onclick="window.ui.loadWorkforce()" class="btn-secondary">Refresh Status</button>
+    </div>
+    <div class="status-display" id="mcp-status" style="margin-top: 10px;">Loading...</div>
   </div>
 </section>
 
@@ -231,4 +256,3 @@
   setInterval(() => window.ui.loadWorkforce(), 30000);
 </script>
 {% endblock %}
-

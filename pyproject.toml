@@ -58,6 +58,7 @@ dependencies = [
     "neo4j>=5.28.2",
     "mcp-neo4j-memory>=0.4.4",
     "py-clob-client>=0.34.5",
+    "fastmcp>=2.13.2",
 ]
 
 [project.optional-dependencies]

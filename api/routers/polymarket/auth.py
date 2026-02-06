@@ -17,7 +17,7 @@ router = APIRouter()
 
 # Pydantic models
 class LoginRequest(BaseModel):
-    api_key: str
+    api_key: str | None = None
     wallet_address: str | None = None
 
 
@@ -33,18 +33,17 @@ class LoginResponse(BaseModel):
 async def login(request: LoginRequest):
     """Authenticate user with API key and issue a session token."""
     try:
-        # Validate the API key
-        if not request.api_key or not request.api_key.strip():
-            raise ValueError("API key is required and cannot be empty")
-
-        if len(request.api_key) < 10:
+        api_key = (request.api_key or os.getenv("POLYMARKET_API_KEY") or "").strip()
+        if not api_key:
+            raise ValueError("API key is required (set in .env or provide in the UI)")
+        if len(api_key) < 10:
             raise ValueError("API key appears to be too short")
 
         # Create a session token and persist session data
         session_id = os.urandom(16).hex()
         session_data = {
-            "api_key": request.api_key,
-            "wallet_address": request.wallet_address,
+            "api_key": api_key,
+            "wallet_address": request.wallet_address or os.getenv("POLYGON_ADDRESS"),
             "authenticated_at": str(__import__("datetime").datetime.now()),
         }
         try:
@@ -57,8 +56,8 @@ async def login(request: LoginRequest):
             "INFO",
             "User authenticated",
             {
-                "api_key": request.api_key[:8] + "...",
-                "wallet": request.wallet_address or "not provided",
+                "api_key": api_key[:8] + "...",
+                "wallet": request.wallet_address or os.getenv("POLYGON_ADDRESS") or "not provided",
             }
         )
 
@@ -66,7 +65,7 @@ async def login(request: LoginRequest):
             status="ok",
             message="Successfully authenticated",
             is_authenticated=True,
-            wallet_address=request.wallet_address,
+            wallet_address=request.wallet_address or os.getenv("POLYGON_ADDRESS"),
             session_token=session_id,
         )
     except ValueError as e:
@@ -111,4 +110,3 @@ async def logout(request: Request):
     except Exception as e:
         logging_service.log_event("ERROR", "Logout failed", {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
-

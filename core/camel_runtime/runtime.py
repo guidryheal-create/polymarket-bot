@@ -116,24 +116,6 @@ class CamelTradingRuntime:
                 )
             return False
 
-    # ------------------------------------------------------------------ #
-    # Workforce interaction                                              #
-    # ------------------------------------------------------------------ #
-    # ✅ REMOVED: Workforce task processing methods
-    # All workforce processing is now handled by pipeline modules:
-    # - DailyProcess: daily wallet distribution
-    # - HourlyProcess: hourly updates (disabled)
-    # - MinuteProcess: minute updates (disabled)
-    
-    # ✅ REMOVED: process_signal and run_task methods
-    # These are replaced by the new pipeline architecture:
-    # - daily_process.py: DailyProcess handles all workforce processing
-    # - PipelineService uses DailyProcess directly
-    # - No more signal processing through runtime - everything goes through pipelines
-
-    # ✅ REMOVED: _process_workforce_task and _workforce_retry_worker
-    # Workforce task processing is now handled directly by DailyProcess and other pipeline modules
-    # Retry logic is handled within the pipeline modules themselves
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #

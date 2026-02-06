@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from enum import Enum
 
 from camel.tasks import Task
 from camel.societies.workforce import Workforce
 
+from core.clients.polymarket_client import PolymarketClient
 from core.logging import log
 
 
@@ -40,7 +41,7 @@ class MarketFilterCriteria(Enum):
 
 class RSSFluxConfig:
     """Configuration for RSS Flux pipeline trigger intervals."""
-    
+
     def __init__(
         self,
         scan_interval: int = 300,  # 5 minutes default
@@ -49,6 +50,8 @@ class RSSFluxConfig:
         max_cache: int = 500,
         max_trades_per_day: int = 10,
         min_confidence: float = 0.65,
+        trigger_type: str = "interval",
+        interval_hours: int = 4,
         cache_path: Optional[str] = None,
     ):
         self.scan_interval = scan_interval
@@ -57,6 +60,8 @@ class RSSFluxConfig:
         self.max_cache = max_cache
         self.max_trades_per_day = max_trades_per_day
         self.min_confidence = min_confidence
+        self.trigger_type = trigger_type
+        self.interval_hours = interval_hours
         self.cache_path = cache_path or "logs/polymarket_feed_cache.json"
         log.info(
             "[RSS FLUX CONFIG] Initialized: scan_interval=%ds, batch_size=%d, "
@@ -80,7 +85,6 @@ class PolymarketRSSFlux:
     - `stop()` : Graceful shutdown
     """
 
-
     def __init__(
         self,
         workforce: Workforce,
@@ -96,17 +100,12 @@ class PolymarketRSSFlux:
         """
         self.config = config or RSSFluxConfig()
         self.workforce = workforce
-        # Allow api_client to be optional for tests; create default PolymarketClient if not supplied
-        if api_client is None:
-            try:
-                from core.clients.polymarket_client import PolymarketClient
-                self.api_client = PolymarketClient()
-            except Exception:
-                self.api_client = None
-        else:
-            self.api_client = api_client
+        self.api_client = api_client or PolymarketClient()
+        self.polymarket_client = self.api_client
         self.scan_interval = self.config.scan_interval
         self.batch_size = self.config.batch_size
+        self.trigger_type = self.config.trigger_type
+        self.interval_hours = self.config.interval_hours
         self._running = False
         self._scan_task: Optional[asyncio.Task] = None
         self._last_scan_cursor = None
@@ -117,6 +116,10 @@ class PolymarketRSSFlux:
         self._feed_cache: Dict[str, Dict[str, Any]] = {}
         self._trades_today = 0
         self._trade_day = datetime.now(timezone.utc).date()
+        self._scan_lock = asyncio.Lock()
+        self._last_trigger_at: Optional[datetime] = None
+        self._last_trigger_type: Optional[str] = None
+        self._last_interval_trigger_at: Optional[datetime] = None
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -223,8 +226,12 @@ class PolymarketRSSFlux:
         """Continuous market scanning loop."""
         while self._running:
             try:
+                if self.trigger_type != "interval":
+                    await asyncio.sleep(5)
+                    continue
+
                 # Scan batch of markets
-                await self.process_market_batch()
+                await self.process_market_batch(trigger_type="interval", verify_positions=True, enforce_limits=True)
 
                 # Wait before next scan
                 await asyncio.sleep(self.scan_interval)
@@ -237,7 +244,45 @@ class PolymarketRSSFlux:
                 # Don't crash - continue scanning
                 await asyncio.sleep(self.scan_interval)
 
-    async def process_market_batch(self) -> Dict[str, Any]:
+    async def _refresh_active_positions(self) -> None:
+        """Refresh active positions from the Polymarket client when available."""
+        if not hasattr(self.polymarket_client, "get_open_positions"):
+            return
+        try:
+            positions = self.polymarket_client.get_open_positions()
+            if asyncio.iscoroutine(positions):
+                positions = await positions
+            positions = positions or {}
+            if isinstance(positions, dict):
+                for market_id, orders in positions.items():
+                    existing = self._active_positions.get(market_id, {})
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    self._active_positions[market_id] = {
+                        **existing,
+                        "market_id": market_id,
+                        "orders": orders,
+                    }
+                address = (
+                    getattr(self.polymarket_client, "polygon_address", None)
+                    or getattr(self.polymarket_client, "address", None)
+                    or "unknown"
+                )
+                short_addr = f"{str(address)[:6]}...{str(address)[-4:]}" if address else "unknown"
+                log.info(
+                    "[POLYMARKET RSS FLUX] Open positions refreshed for wallet %s: %d",
+                    short_addr,
+                    len(self._active_positions),
+                )
+        except Exception as exc:
+            log.warning(f"[POLYMARKET RSS FLUX] Failed to refresh open positions: {exc}")
+
+    async def process_market_batch(
+        self,
+        trigger_type: str = "interval",
+        verify_positions: bool = True,
+        enforce_limits: bool = True,
+    ) -> Dict[str, Any]:
         """Scan and process a batch of Polymarket markets.
 
         Workflow:
@@ -249,116 +294,153 @@ class PolymarketRSSFlux:
         Returns:
             Summary of batch processing
         """
-        batch_id = f"batch_{int(datetime.now(timezone.utc).timestamp())}"
-        log.info(f"[POLYMARKET RSS FLUX] Processing batch {batch_id}")
+        if self._scan_lock.locked():
+            return {
+                "status": "in_progress",
+                "triggered": False,
+                "reason": "scan_in_progress",
+                "trigger_type": trigger_type,
+            }
 
-        try:
-            # Step 1: Market Scanning Task (via Workforce)
-            markets = await self._execute_market_scanner()
+        now = datetime.now(timezone.utc)
+        if now.date() > self._trade_day:
+            self._trade_day = now.date()
+            self._trades_today = 0
+        use_cache = trigger_type != "manual"
+        check_threshold = trigger_type != "manual"
+        if trigger_type == "manual":
+            verify_positions = False
+            enforce_limits = False
+        if (
+            trigger_type == "interval"
+            and self._last_interval_trigger_at
+            and (now - self._last_interval_trigger_at).total_seconds() < self.scan_interval
+        ):
+            return {
+                "status": "skipped",
+                "triggered": False,
+                "reason": "interval_throttle",
+                "trigger_type": trigger_type,
+            }
 
-            if not markets:
-                log.debug("[POLYMARKET RSS FLUX] No markets found in scan")
-                return {"batch_id": batch_id, "markets_found": 0, "analyzed": 0}
+        async with self._scan_lock:
+            self._last_trigger_at = now
+            self._last_trigger_type = trigger_type
+            if trigger_type == "interval":
+                self._last_interval_trigger_at = now
 
-            # Step 2: Update cached feed and defer processing until threshold is met
-            self._update_feed_cache(markets)
-            pending_markets = list(self._feed_cache.values())
-            if len(pending_markets) < self.review_threshold:
-                self._save_cache()
-                log.info(
-                    f"[POLYMARKET RSS FLUX] Cached {len(pending_markets)} markets "
-                    f"(threshold={self.review_threshold}); waiting to review."
+            batch_id = f"batch_{int(datetime.now(timezone.utc).timestamp())}"
+            log.info(f"[POLYMARKET RSS FLUX] Processing batch {batch_id} ({trigger_type})")
+
+            try:
+                # Step 0: Refresh active positions
+                await self._refresh_active_positions()
+
+                # Step 1: Fetch markets directly (source of truth)
+                markets = await self._fetch_latest_markets()
+                if not markets:
+                    log.debug("[POLYMARKET RSS FLUX] No markets found in scan")
+                    return {"batch_id": batch_id, "markets_found": 0, "analyzed": 0}
+
+                pending_markets: List[Dict[str, Any]] = []
+                if use_cache:
+                    # Step 2: Update cached feed and defer processing until threshold is met
+                    self._update_feed_cache(markets)
+                    pending_markets = list(self._feed_cache.values())
+                    if check_threshold and len(pending_markets) < self.review_threshold:
+                        self._save_cache()
+                        log.info(
+                            f"[POLYMARKET RSS FLUX] Cached {len(pending_markets)} markets "
+                            f"(threshold={self.review_threshold}); waiting to review."
+                        )
+                        return {
+                            "batch_id": batch_id,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "markets_scanned": len(markets),
+                            "pending_review": len(pending_markets),
+                            "threshold": self.review_threshold,
+                            "trigger_type": trigger_type,
+                        }
+
+                # Step 3: Choose batch candidates
+                if use_cache:
+                    filtered = self._filter_markets([m["data"] for m in pending_markets])
+                else:
+                    filtered = markets[: self.batch_size]
+                if not filtered:
+                    return {
+                        "batch_id": batch_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "markets_scanned": len(markets),
+                        "opportunities_filtered": 0,
+                        "trigger_type": trigger_type,
+                    }
+
+                # Step 4: Run a single workforce task for the batch
+                before_positions = set(self._active_positions.keys())
+                workforce_result = await self._run_batch_task(
+                    filtered,
+                    trigger_type=trigger_type,
+                    enforce_limits=enforce_limits,
                 )
-                return {
+                await self._refresh_active_positions()
+                after_positions = set(self._active_positions.keys())
+                new_positions = list(after_positions - before_positions)
+                if enforce_limits:
+                    self._trades_today += len(new_positions)
+
+                if use_cache:
+                    # Mark processed markets as exhausted and persist cache
+                    for market in filtered:
+                        market_id = market.get("id")
+                        if market_id and market_id in self._feed_cache:
+                            self._feed_cache[market_id]["exhausted"] = True
+                    self._update_feed_cache([])  # prune exhausted
+                    self._save_cache()
+
+                summary = {
                     "batch_id": batch_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "markets_scanned": len(markets),
-                    "pending_review": len(pending_markets),
-                    "threshold": self.review_threshold,
+                    "opportunities_filtered": len(filtered),
+                    "trades_executed": len(new_positions),
+                    "new_positions": new_positions,
+                    "positions_active": len(self._active_positions),
+                    "pending_review": len(self._feed_cache) if use_cache else 0,
+                    "trigger_type": trigger_type,
+                    "workforce_result": workforce_result,
                 }
 
-            # Step 3: Filter markets by criteria (from cached feed)
-            filtered = self._filter_markets([m["data"] for m in pending_markets])
-            log.info(
-                f"[POLYMARKET RSS FLUX] Found {len(filtered)} opportunities from {len(markets)} markets"
-            )
+                log.info(
+                    "[POLYMARKET RSS FLUX] Batch %s complete: %d filtered, %d new positions",
+                    batch_id,
+                    summary["opportunities_filtered"],
+                    summary["trades_executed"],
+                )
 
-            # Step 4: Analyze each promising market
-            analyzed_results = []
-            for market_data in filtered:
-                result = await self._analyze_and_decide(market_data)
-                analyzed_results.append(result)
+                return summary
 
-                # Give other tasks a chance to run
-                await asyncio.sleep(0.1)
+            except Exception as exc:
+                log.error(f"[POLYMARKET RSS FLUX] Batch processing failed: %s", exc, exc_info=True)
+                return {
+                    "batch_id": batch_id,
+                    "error": str(exc),
+                    "status": "failed",
+                    "trigger_type": trigger_type,
+                }
 
-            # Step 5: Execute trades for high-confidence opportunities
-            executed_trades = []
-            for result in analyzed_results:
-                if result["decision"] == "BUY" and result["confidence"] > 0.65:
-                    trade_result = await self._execute_trade(result)
-                    executed_trades.append(trade_result)
-
-            # Mark processed markets as exhausted and persist cache
-            for result in analyzed_results:
-                market_id = result.get("market_id")
-                if market_id and market_id in self._feed_cache:
-                    self._feed_cache[market_id]["exhausted"] = True
-            self._update_feed_cache([])  # prune exhausted
-            self._save_cache()
-
-            # Step 6: Track results
-            summary = {
-                "batch_id": batch_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "markets_scanned": len(markets),
-                "opportunities_filtered": len(filtered),
-                "analyzed": len(analyzed_results),
-                "high_confidence": sum(1 for r in analyzed_results if r["confidence"] > 0.65),
-                "trades_executed": len(executed_trades),
-                "positions_active": len(self._active_positions),
-                "pending_review": len(self._feed_cache),
-            }
-
-            log.info(
-                f"[POLYMARKET RSS FLUX] Batch {batch_id} complete: "
-                f"{summary['opportunities_filtered']} filtered, "
-                f"{summary['high_confidence']} high-confidence, "
-                f"{summary['trades_executed']} trades"
-            )
-
-            return summary
-
-        except Exception as exc:
-            log.error(f"[POLYMARKET RSS FLUX] Batch processing failed: %s", exc, exc_info=True)
-            return {
-                "batch_id": batch_id,
-                "error": str(exc),
-                "status": "failed",
-            }
-
-    async def _execute_market_scanner(self) -> List[Dict[str, Any]]:
-        """Execute market scanning task via Workforce.
-
-        Returns list of markets from Polymarket API.
-        """
-        scanner_content = (
-            f"Scan Polymarket for active markets.\n\n"
-            f"**TASK:**\n"
-            f"1. Use search_markets() to find markets (no filter = all active)\n"
-            f"2. Use get_trending_markets(timeframe='24h', limit={self.batch_size}) for high-activity markets\n"
-            f"3. Return market summaries with ID, title, odds, volume, liquidity\n\n"
-            f"**OUTPUT:** [Market Scan Result] with {self.batch_size} market records."
-        )
-
-        scanner_task = Task(content=scanner_content)
-
+    async def _fetch_latest_markets(self) -> List[Dict[str, Any]]:
+        """Fetch the latest markets directly from Polymarket API."""
+        if not self.polymarket_client:
+            return []
         try:
-            # Execute task through workforce
-            result = await self._execute_task(scanner_task, "market_scanner")
-            return result.get("markets", []) if result else []
+            markets = await self.polymarket_client.search_markets(
+                query="",
+                limit=self.batch_size,
+            )
+            return markets or []
         except Exception as exc:
-            log.warning("[POLYMARKET RSS FLUX] Market scan failed: %s", exc)
+            log.warning("[POLYMARKET RSS FLUX] Latest market fetch failed: %s", exc)
             return []
 
     def _filter_markets(self, markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -417,170 +499,107 @@ class PolymarketRSSFlux:
 
         return filtered[:20]  # Limit to top 20 opportunities per scan
 
-    async def _analyze_and_decide(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze market and make trade decision via Workforce.
+    async def _run_batch_task(
+        self,
+        markets: List[Dict[str, Any]],
+        trigger_type: str,
+        enforce_limits: bool,
+    ) -> Dict[str, Any]:
+        """Run a single CAMEL workforce task for the batch (analysis + trade)."""
+        if not markets:
+            return {"status": "skipped", "reason": "no_markets"}
 
-        Performs multi-stage analysis:
-        1. Get market details (orderbook, recent trades)
-        2. Analyze sentiment (news, social)
-        3. Analyze prices and trends (all intervals)
-        4. Calculate opportunity score
-        5. Return BUY/SELL/SKIP decision
+        market_titles = [m.get("title", "Unknown Market") for m in markets]
+        market_ids = [m.get("id") for m in markets if m.get("id")]
 
-        Returns:
-            Decision dict with confidence score
-        """
-        market_id = market_data.get("id", "unknown")
+        allow_execution = True
+        if enforce_limits and self._trades_today >= self.config.max_trades_per_day:
+            allow_execution = False
 
-        analysis_content = (
-            f"Analyze Polymarket opportunity: {market_data.get('title', 'Unknown')}\n\n"
-            f"**MARKET DETAILS:**\n"
-            f"- ID: {market_id}\n"
-            f"- Volume 24h: ${market_data.get('volume_24h', 0)}\n"
-            f"- Liquidity: {market_data.get('liquidity_score', 0)}%\n"
-            f"- Spread: {market_data.get('bid_ask_spread', 0)}%\n\n"
-            f"**ANALYSIS STEPS:**\n"
-            f"1. Use get_market_details() for full market data\n"
-            f"2. Use get_orderbook() to check bid-ask depth and balance\n"
-            f"3. Analyze market activity patterns\n"
-            f"4. Analyze price trends:\n"
-            f"   - Current Yes/No odds\n"
-            f"   - Recent price movements\n"
-            f"   - Compare to forecasting trends if available\n"
-            f"5. Consensus copy risk check:\n"
-            f"   - Estimate crowd consensus (if available)\n"
-            f"   - Compare to market implied probability\n"
-            f"   - Estimate copy_trade_edge and win-rate\n"
-            f"6. Score opportunity:\n"
-            f"   - If strong signals & low risk: BUY (confidence > 0.65)\n"
-            f"   - If mixed signals: HOLD (confidence 0.4-0.65)\n"
-            f"   - If weak or risky: SKIP (confidence < 0.4)\n\n"
-            f"**OUTPUT:** Decision (BUY/HOLD/SKIP), confidence (0.0-1.0), explanation.\n"
-            f"Include consensus_analysis with copy_trade_edge and estimated_win_rate."
+        limit_note = "Manual override: bypass limits and confidence thresholds."
+        if enforce_limits:
+            limit_note = (
+                f"Respect limits (max_trades_per_day={self.config.max_trades_per_day}, "
+                f"min_confidence={self.config.min_confidence:.2f})."
+            )
+        if not allow_execution:
+            limit_note += " Trading execution is disabled for this batch (daily limit reached)."
+
+        root_task = Task(
+            content=(
+                "End-to-end analysis and trade decision for Polymarket batch.\n\n"
+                f"Trigger: {trigger_type}\n"
+                f"Batch size: {len(markets)}\n"
+                f"Markets: {market_titles}\n\n"
+                "Use the Polymarket toolkit to fetch data and execute trades. "
+                "Do not return structured JSON as source of truth. "
+                f"{limit_note}"
+            ),
+            type="orchestration",
+            additional_info={
+                "trigger_type": trigger_type,
+                "market_ids": market_ids,
+            },
         )
 
-        analysis_task = Task(content=analysis_content)
-
-        try:
-            result = await self._execute_task(analysis_task, f"market_analysis_{market_id[:8]}")
-
-            return {
-                "market_id": market_id,
-                "market_title": market_data.get("title"),
-                "decision": result.get("decision", "SKIP"),
-                "confidence": result.get("confidence", 0.0),
-                "sentiment_score": result.get("sentiment_score", 0.0),
-                "opportunity_score": result.get("opportunity_score", 0.0),
-                "reasoning": result.get("reasoning", ""),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-        except Exception as exc:
-            log.warning(f"[POLYMARKET RSS FLUX] Analysis failed for {market_id}: {exc}")
-            return {
-                "market_id": market_id,
-                "decision": "SKIP",
-                "confidence": 0.0,
-                "error": str(exc),
-            }
-
-    async def _execute_trade(self, analysis_result: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute trade via Workforce if conditions are met.
-
-        Checks daily trade limits and confidence thresholds before execution.
-
-        Returns:
-            Trade execution result (success/failure, position details)
-        """
-        market_id = analysis_result["market_id"]
-        confidence = analysis_result["confidence"]
-
-        # Reset daily trade count if date changed
-        today = datetime.now(timezone.utc).date()
-        if today > self._trade_day:
-            self._trades_today = 0
-            self._trade_day = today
-
-        # Check daily trading limit
-        if self._trades_today >= self.config.max_trades_per_day:
-            log.warning(
-                "[POLYMARKET RSS FLUX] Daily trading limit reached: %d/%d",
-                self._trades_today,
-                self.config.max_trades_per_day,
-            )
-            return {
-                "status": "skipped",
-                "market_id": market_id,
-                "reason": f"Daily trading limit reached ({self._trades_today}/{self.config.max_trades_per_day})",
-            }
-
-        # Check confidence threshold
-        if confidence < self.config.min_confidence:
-            log.debug(
-                "[POLYMARKET RSS FLUX] Confidence below threshold: %.2f < %.2f",
-                confidence,
-                self.config.min_confidence,
-            )
-            return {
-                "status": "skipped",
-                "market_id": market_id,
-                "reason": f"Confidence below threshold ({confidence:.2f} < {self.config.min_confidence:.2f})",
-            }
-
-        trade_content = (
-            f"Execute trade for Polymarket opportunity.\n\n"
-            f"**MARKET:** {analysis_result['market_title']}\n"
-            f"**DECISION:** {analysis_result['decision']}\n"
-            f"**CONFIDENCE:** {confidence:.2%}\n"
-            f"**REASONING:** {analysis_result['reasoning']}\n\n"
-            f"**TASK:**\n"
-            f"1. Validate market still meets criteria (get_market_details)\n"
-            f"2. Calculate position size based on account balance and confidence\n"
-            f"3. Execute trade:\n"
-            f"   - For mock trading: Log position to memory\n"
-            f"   - For real: Use Polymarket trading endpoints\n"
-            f"4. Record position details (entry price, size, timestamp)\n"
-            f"5. Set stop-loss and take-profit levels\n\n"
-            f"**OUTPUT:** Trade execution result with position ID or error."
+        fetch_task = Task(
+            content=(
+                "Fetch full market details and orderbooks for each market in the batch.\n"
+                "Use: get_market_details(), get_orderbook()."
+            ),
+            type="market_fetch",
+            parent=root_task,
         )
 
-        trade_task = Task(content=trade_content)
+        analysis_task = Task(
+            content=(
+                "Analyze each market and estimate confidence (0.0–1.0). "
+                "Evaluate liquidity, spread, odds, and crowd consensus risk."
+            ),
+            type="analysis",
+            parent=root_task,
+            dependencies=[fetch_task],
+        )
 
-        try:
-            result = await self._execute_task(trade_task, f"trade_executor_{market_id[:8]}")
-
-            position_id = result.get("position_id", f"pos_{market_id}_{int(datetime.now(timezone.utc).timestamp())}")
-            self._active_positions[position_id] = {
-                "market_id": market_id,
-                "market_title": analysis_result["market_title"],
-                "entry_price": result.get("entry_price", 0.5),
-                "position_size": result.get("position_size", 0.1),
-                "confidence": confidence,
-                "entry_time": datetime.now(timezone.utc).isoformat(),
-                "status": "OPEN",
-            }
-
-            self._trades_today += 1
-            log.info(
-                f"[POLYMARKET RSS FLUX] Trade executed: {position_id} "
-                f"({analysis_result['market_title']} @ {confidence:.2%} confidence)"
+        if allow_execution:
+            decision_task = Task(
+                content=(
+                    "For each market, decide BUY / HOLD / SKIP. "
+                    "Execute trades only for BUY using the Polymarket toolkit."
+                ),
+                type="decision",
+                parent=root_task,
+                dependencies=[analysis_task],
             )
+            root_task.subtasks = [fetch_task, analysis_task, decision_task]
+        else:
+            decision_task = Task(
+                content=(
+                    "For each market, decide BUY / HOLD / SKIP. "
+                    "Execution is disabled for this batch."
+                ),
+                type="decision",
+                parent=root_task,
+                dependencies=[analysis_task],
+            )
+            root_task.subtasks = [fetch_task, analysis_task, decision_task]
 
-            return {
-                "status": "success",
-                "position_id": position_id,
-                "market_id": market_id,
-                "entry_price": result.get("entry_price"),
-                "position_size": result.get("position_size"),
-            }
+        result = await self._execute_task(root_task, "batch_orchestration")
 
-        except Exception as exc:
-            log.warning(f"[POLYMARKET RSS FLUX] Trade execution failed for {market_id}: {exc}")
-            return {
-                "status": "failed",
-                "market_id": market_id,
-                "error": str(exc),
-            }
+        workforce_snapshot = {}
+        if hasattr(self.workforce, "get_workforce_log_tree"):
+            workforce_snapshot["task_tree"] = self.workforce.get_workforce_log_tree()
+        if hasattr(self.workforce, "get_completed_tasks"):
+            workforce_snapshot["completed_tasks"] = self.workforce.get_completed_tasks()
+        if hasattr(self.workforce, "get_workforce_kpis"):
+            workforce_snapshot["kpis"] = self.workforce.get_workforce_kpis()
+
+        return {
+            "status": "completed",
+            "result": result,
+            "workforce_observability": workforce_snapshot,
+            "execution_enabled": allow_execution,
+        }
 
     async def _execute_task(
         self, task: Task, task_type: str
@@ -599,19 +618,16 @@ class PolymarketRSSFlux:
                 f"[POLYMARKET RSS FLUX] Executing task ({task_type}) "
                 f"via workforce: {self.workforce.__class__.__name__}"
             )
-            
+
             # Try multiple execution methods in fallback order
-            if hasattr(self.workforce, "process_task"):
-                log.debug(f"[POLYMARKET RSS FLUX] Using process_task")
+            if hasattr(self.workforce, "process_task_async"):
+                log.debug("[POLYMARKET RSS FLUX] Using process_task_async")
+                result = await self.workforce.process_task_async(task)
+            elif hasattr(self.workforce, "process_task"):
+                log.debug("[POLYMARKET RSS FLUX] Using process_task")
                 result = await self.workforce.process_task(task)
-            elif hasattr(self.workforce, "execute_task"):
-                log.debug(f"[POLYMARKET RSS FLUX] Using execute_task")
-                result = await self.workforce.execute_task(task)
-            elif hasattr(self.workforce, "run"):
-                log.debug(f"[POLYMARKET RSS FLUX] Using run")
-                result = await self.workforce.run(task)
             else:
-                log.warning(f"[POLYMARKET RSS FLUX] Workforce has no task execution method")
+                log.warning("[POLYMARKET RSS FLUX] Workforce has no task execution method")
                 result = {"status": "placeholder"}
 
             return result if isinstance(result, dict) else {}
@@ -635,5 +651,10 @@ class PolymarketRSSFlux:
             "trades_max_per_day": self.config.max_trades_per_day,
             "min_confidence": self.config.min_confidence,
             "cached_markets": len(self._feed_cache),
+            "last_trigger_at": self._last_trigger_at.isoformat() if self._last_trigger_at else None,
+            "last_trigger_type": self._last_trigger_type,
+            "scan_in_progress": self._scan_lock.locked(),
+            "trigger_type": self.trigger_type,
+            "interval_hours": self.interval_hours,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }

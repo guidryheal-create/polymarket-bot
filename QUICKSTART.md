@@ -70,6 +70,10 @@ You can either install the project locally or use the provided Docker setup.
 
     **Important:** Do not commit your `.env` file to version control.
 
+3.  **UI Defaults:**
+
+    The UI uses `.env` values by default. If you leave the UI login API key blank, the backend falls back to `POLYMARKET_API_KEY`.
+
 ## Running the Application
 
 ### Local
@@ -87,3 +91,14 @@ If you are using the Docker setup, the application will be started automatically
 ## Accessing the API
 
 Once the application is running, you can access the API at `http://localhost:8000`. The API documentation is available at `http://localhost:8000/docs`.
+
+## Trigger Modes (UI)
+
+*   **Manual**: Runs immediately on the latest feed and bypasses RSS cache thresholds and trade limit checks.
+*   **Interval**: Runs on a schedule (hours/days) and enforces RSS cache thresholds, verification, and limits.
+
+Configure trigger mode and interval hours in the Workforce UI.
+
+## MCP Server
+
+The workforce can be exposed as an MCP server (default `localhost:8001`). If you run via Docker, make sure port `8001` is published (already configured in `docker-compose.yml`).

@@ -56,8 +56,8 @@
         </div>
         <form id="auth-form" onsubmit="window.ui.handleLogin(event)" style="display: flex; flex-direction: column; gap: 12px;">
           <div style="display: flex; flex-direction: column; gap: 6px;">
-            <label for="auth-api-key">API Key</label>
-            <input type="password" id="auth-api-key" placeholder="Your Polymarket API key" required style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
+            <label for="auth-api-key">API Key (optional, falls back to .env)</label>
+            <input type="password" id="auth-api-key" placeholder="Use .env default if left blank" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
           </div>
           <div style="display: flex; flex-direction: column; gap: 6px;">
             <label for="auth-wallet">Wallet Address (optional)</label>

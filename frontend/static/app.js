@@ -52,24 +52,25 @@ async function loadDashboard() {
   setLoading('workforce-flux', true);
   setLoading('decision-list', true);
   
-  const [summary, workforce, rss, decisions, logs] = await Promise.all([
+  const [summary, workforce, rss, decisions, logs, flux] = await Promise.all([
     apiGet('/api/polymarket/results/summary'),
     apiGet('/api/polymarket/workforce/status'),
     apiGet('/api/polymarket/rss/cache'),
     apiGet('/api/polymarket/decisions?limit=10'),
     apiGet('/api/polymarket/logs?limit=20'),
+    apiGet('/api/polymarket/flux/status'),
   ]);
 
   document.getElementById('kpi-total-trades').textContent = (summary.summary && summary.summary.total_trades) || 0;
   document.getElementById('kpi-open-positions').textContent = (workforce.limits_status && workforce.limits_status.open_positions) || 0;
-  document.getElementById('kpi-rss-bets').textContent = rss.count || 0;
+  const rssCount = rss && rss.count ? rss.count : 0;
+  const openPositions = (workforce.limits_status && workforce.limits_status.open_positions) || 0;
+  document.getElementById('kpi-rss-bets').textContent = rssCount || openPositions || 0;
 
-  const fluxStatus = workforce.active_flux || 'unknown';
+  const fluxStatus = (flux && flux.status === 'ok' && flux.scheduler_running) ? 'running' : (workforce.active_flux || 'unknown');
   document.getElementById('workforce-flux').textContent = fluxStatus;
   document.getElementById('workforce-flux').className = `tag ${fluxStatus === 'running' ? 'ok' : fluxStatus === 'stopped' ? 'warn' : 'muted'}`;
 
-  const triggerType = (workforce.trigger_config && workforce.trigger_config.trigger_type) || 'n/a';
-  document.getElementById('workforce-trigger').textContent = triggerType;
 
   const decisionList = document.getElementById('decision-list');
   decisionList.innerHTML = '';
@@ -233,22 +234,31 @@ async function stopFlux() {
 async function loadWorkforce() {
   setLoading('wf-status', true);
   setLoading('rss-cache', true);
+  setLoading('mcp-status', true);
   
-  const [status, rss] = await Promise.all([
+  const [status, rss, flux, fluxConfig, mcp] = await Promise.all([
     apiGet('/api/polymarket/workforce/status'),
     apiGet('/api/polymarket/rss/cache'),
+    apiGet('/api/polymarket/flux/status'),
+    apiGet('/api/polymarket/flux/config'),
+    apiGet('/api/polymarket/workforce/mcp'),
   ]);
   
   setLoading('wf-status', false);
   setLoading('rss-cache', false);
+  setLoading('mcp-status', false);
   
   // Workforce Status
   const wfEl = document.getElementById('wf-status');
   if (status && status.status === 'ok') {
-    const triggerType = status.trigger_config?.trigger_type || 'manual';
+    const triggerType = fluxConfig?.trigger_type || 'manual';
     const triggerSelect = document.getElementById('trigger-type-select');
     if (triggerSelect) {
       triggerSelect.value = triggerType;
+    }
+    const intervalInput = document.getElementById('trigger-interval-hours');
+    if (intervalInput && fluxConfig?.interval_hours) {
+      intervalInput.value = fluxConfig.interval_hours;
     }
     wfEl.innerHTML = `
       <div class="status-item">
@@ -275,6 +285,16 @@ async function loadWorkforce() {
         <div class="status-item">
           <span class="label">Max Positions:</span>
           <span class="value">${status.limits_status.max_positions || 'unlimited'}</span>
+        </div>
+      ` : ''}
+      ${flux ? `
+        <div class="status-item">
+          <span class="label">Scan In Progress:</span>
+          <span class="value">${flux.scan_in_progress ? 'yes' : 'no'}</span>
+        </div>
+        <div class="status-item">
+          <span class="label">Last Trigger:</span>
+          <span class="value">${flux.last_trigger_type || 'n/a'} ${flux.last_trigger_at ? `@ ${new Date(flux.last_trigger_at).toLocaleTimeString()}` : ''}</span>
         </div>
       ` : ''}
     `;
@@ -306,6 +326,36 @@ async function loadWorkforce() {
   } else {
     rssEl.innerHTML = '<div class="muted">No RSS cache available</div>';
   }
+
+  // MCP Status
+  const mcpEl = document.getElementById('mcp-status');
+  if (mcpEl) {
+    if (mcp && mcp.status === 'ok') {
+      const meta = mcp.mcp || {};
+      const nameInput = document.getElementById('mcp-name');
+      const hostInput = document.getElementById('mcp-host');
+      const portInput = document.getElementById('mcp-port');
+      if (nameInput && meta.name) nameInput.value = meta.name;
+      if (hostInput && meta.host) hostInput.value = meta.host;
+      if (portInput && meta.port) portInput.value = meta.port;
+      mcpEl.innerHTML = `
+        <div class="status-item">
+          <span class="label">Server:</span>
+          <span class="value">${mcp.started ? 'running' : 'stopped'}</span>
+        </div>
+        <div class="status-item">
+          <span class="label">Host:</span>
+          <span class="value">${meta.host || 'n/a'}</span>
+        </div>
+        <div class="status-item">
+          <span class="label">Port:</span>
+          <span class="value">${meta.port || 'n/a'}</span>
+        </div>
+      `;
+    } else {
+      mcpEl.innerHTML = '<div class="muted">MCP server not initialized</div>';
+    }
+  }
 }
 
 async function triggerWorkforce() {
@@ -313,12 +363,12 @@ async function triggerWorkforce() {
   if (btn) btn.disabled = true;
   
   setLoading('wf-trigger-result', true);
-  const res = await apiPost('/api/polymarket/workforce/trigger', {});
+  const res = await apiPost('/api/polymarket/flux/trigger-scan?verify_positions=false&start_if_stopped=true', {});
   setLoading('wf-trigger-result', false);
   
   const resultEl = document.getElementById('wf-trigger-result');
-  if (res.status === 'ok') {
-    resultEl.innerHTML = `<div class="success">✓ ${res.message || 'Workforce triggered'}</div>`;
+  if (res.status === 'ok' || res.status === 'triggered') {
+    resultEl.innerHTML = `<div class="success">✓ ${res.message || 'Flux triggered'}</div>`;
     resultEl.style.display = 'block';
     setTimeout(() => loadWorkforce(), 1000);
   } else {
@@ -336,21 +386,40 @@ async function triggerWorkforce() {
 
 async function changeTriggerType() {
   const select = document.getElementById('trigger-type-select');
+  const intervalInput = document.getElementById('trigger-interval-hours');
   if (!select) return;
-  
+
   const newType = select.value;
-  const payload = {
-    trigger_config: {
-      trigger_type: newType,
-    }
-  };
-  
+  const intervalHours = intervalInput ? parseInt(intervalInput.value || '4', 10) : 4;
+  const qs = new URLSearchParams({
+    trigger_type: newType,
+    interval_hours: String(Math.max(1, intervalHours)),
+  }).toString();
+
   try {
-    const data = await apiPost('/api/polymarket/config', payload);
-    alert(`Trigger type changed to: ${newType}`);
+    await apiPost(`/api/polymarket/flux/config?${qs}`, {});
     await loadWorkforce();
   } catch (err) {
     showError('wf-status', 'Failed to change trigger type');
+  }
+}
+
+async function startMcp() {
+  const name = document.getElementById('mcp-name')?.value || 'CAMEL-Workforce';
+  const host = document.getElementById('mcp-host')?.value || 'localhost';
+  const port = document.getElementById('mcp-port')?.value || '8001';
+  const payload = {
+    name,
+    host,
+    port: parseInt(port, 10) || 8001,
+    start_server: true,
+  };
+  const res = await apiPost('/api/polymarket/workforce/mcp', payload);
+  if (res.status === 'ok') {
+    alert('MCP server initialized');
+    await loadWorkforce();
+  } else {
+    showError('mcp-status', res.message || 'Failed to start MCP server');
   }
 }
 
@@ -380,8 +449,11 @@ window.ui = {
   loadWorkforce,
   triggerWorkforce,
   changeTriggerType,
+  startMcp,
   setLoading,
   showError,
+  loadOpenOrders,
+  loadTrades,
   showAuthModal: () => {
     document.getElementById('auth-modal').style.display = 'flex';
   },
@@ -395,7 +467,8 @@ window.ui = {
     const walletAddr = document.getElementById('auth-wallet-input').value;
     
     try {
-      const payload = { api_key: apiKey };
+      const payload = {};
+      if (apiKey && apiKey.trim()) payload.api_key = apiKey.trim();
       if (walletAddr) payload.wallet_address = walletAddr;
       
       const res = await apiPost('/api/polymarket/auth/login', payload);
@@ -466,6 +539,51 @@ async function loadClobSnapshot() {
     console.warn('loadClobSnapshot failed', err);
     statusEl.textContent = 'CLOB data unavailable (missing auth or network).';
   }
+}
+
+async function loadOpenOrders() {
+  const market = document.getElementById('orders-market')?.value || '';
+  const ordersTable = document.getElementById('orders-open');
+  const emptyEl = document.getElementById('orders-open-empty');
+  if (!ordersTable) return;
+
+  const qs = market ? `?market=${encodeURIComponent(market)}` : '';
+  const data = await apiGet(`/api/polymarket/clob/orders/open${qs}`);
+  const orders = data.orders || [];
+  ordersTable.innerHTML = '';
+  if (!orders.length) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  orders.forEach(o => {
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${o.order_id || o.id || ''}</td><td>${o.market || o.market_id || ''}</td><td>${o.side || ''}</td><td>${o.price ?? ''}</td><td>${o.size ?? ''}</td><td>-</td>`;
+    ordersTable.appendChild(row);
+  });
+}
+
+async function loadTrades() {
+  const market = document.getElementById('trades-market')?.value || '';
+  const tradesTable = document.getElementById('trades-list');
+  const emptyEl = document.getElementById('trades-list-empty');
+  if (!tradesTable) return;
+
+  const qs = market ? `?market=${encodeURIComponent(market)}` : '';
+  const data = await apiGet(`/api/polymarket/clob/trades${qs}`);
+  const trades = data.trades || [];
+  tradesTable.innerHTML = '';
+  if (!trades.length) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+  trades.forEach(t => {
+    const row = document.createElement('tr');
+    const ts = t.timestamp ? new Date(t.timestamp).toLocaleString() : '';
+    row.innerHTML = `<td>${t.market || t.market_id || ''}</td><td>${t.side || t.taker_side || ''}</td><td>${t.price ?? ''}</td><td>${t.size ?? ''}</td><td>${ts}</td>`;
+    tradesTable.appendChild(row);
+  });
 }
 
 // Initialize event listeners when DOM is ready
