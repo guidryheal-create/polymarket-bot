@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import threading
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -15,7 +16,7 @@ from api.models.polymarket import RssCacheResponse, WorkforceStatusResponse
 from api.services.polymarket.config_service import process_config_service
 
 from api.services.polymarket.logging_service import logging_service
-from core.camel_runtime.societies import TradingWorkforceSociety
+from core.camel_runtime import CamelTradingRuntime
 
 router = APIRouter()
 
@@ -40,8 +41,8 @@ async def trigger_workforce():
     global _workforce_mcp_thread
     try:
         logging_service.log_event("INFO", "Manual workforce trigger received", {})
-        society = TradingWorkforceSociety()
-        workforce = await society.build()
+        runtime = await CamelTradingRuntime.instance()
+        workforce = await runtime.get_workforce()
         task = "Run the workforce agent cycle to check for new opportunities."
         if hasattr(workforce, "process_task_async"):
             result = await workforce.process_task_async(task)
@@ -149,10 +150,16 @@ async def stop_flux():
 @router.post("/workforce/mcp")
 async def start_workforce_mcp(payload: MCPStartRequest):
     """Create (and optionally start) an MCP server from the workforce."""
-    global _workforce_mcp_instance, _workforce_mcp_task, _workforce_mcp_meta
+    global _workforce_mcp_instance, _workforce_mcp_task, _workforce_mcp_meta, _workforce_mcp_thread
     try:
-        society = TradingWorkforceSociety()
-        workforce = await society.build()
+        if os.getenv("MCP_IN_API_DISABLED", "true").lower() in {"1", "true", "yes"}:
+            return {
+                "status": "error",
+                "message": "MCP server is disabled in the API process. Run the workforce MCP in its own service/container.",
+                "started": False,
+            }
+        runtime = await CamelTradingRuntime.instance()
+        workforce = await runtime.get_workforce()
 
         if not hasattr(workforce, "to_mcp"):
             return {"status": "error", "message": "Workforce does not support to_mcp()."}
@@ -221,6 +228,13 @@ async def start_workforce_mcp(payload: MCPStartRequest):
 @router.get("/workforce/mcp")
 async def workforce_mcp_status():
     """Get MCP server status for the workforce."""
+    if os.getenv("MCP_IN_API_DISABLED", "true").lower() in {"1", "true", "yes"}:
+        return {
+            "status": "ok",
+            "started": False,
+            "mcp": None,
+            "message": "MCP server runs in a separate service/container.",
+        }
     return {
         "status": "ok",
         "started": (

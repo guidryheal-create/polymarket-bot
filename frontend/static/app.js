@@ -23,7 +23,11 @@ function showError(elementId, message) {
 
 async function apiGet(path) {
   try {
-    const res = await fetch(path, { credentials: 'same-origin' });
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(path, {
+      credentials: 'same-origin',
+      headers: token ? { 'X-Session-Token': token, 'Authorization': `Bearer ${token}` } : {},
+    });
     if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -34,10 +38,14 @@ async function apiGet(path) {
 
 async function apiPost(path, payload) {
   try {
+    const token = localStorage.getItem('session_token');
     const res = await fetch(path, {
       method: 'POST',
       credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Session-Token': token, 'Authorization': `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(payload || {}),
     });
     if (!res.ok) throw new Error(`POST ${path} -> ${res.status}`);
@@ -93,14 +101,32 @@ async function loadDashboard() {
 
 async function loadMarkets() {
   const query = document.getElementById('market-query').value || 'market';
-  const data = await apiGet(`/api/polymarket/markets/search?q=${encodeURIComponent(query)}&limit=20`);
+  const category = document.getElementById('market-category')?.value || '';
+  const categoryParam = category ? `&category=${encodeURIComponent(category)}` : '';
+  const data = await apiGet(`/api/polymarket/markets/search?q=${encodeURIComponent(query)}&limit=20&active_only=true${categoryParam}`);
   const list = document.getElementById('market-results');
+  const empty = document.getElementById('market-results-empty');
   list.innerHTML = '';
   const arr = data.markets || data.results || [];
+  if (!arr.length && empty) {
+    empty.style.display = 'block';
+  } else if (empty) {
+    empty.style.display = 'none';
+  }
   arr.forEach(m => {
     const title = m.title || m.question || m.name || '';
     const row = document.createElement('tr');
-    row.innerHTML = `<td>${m.id || m.market_id || ''}</td><td>${title}</td><td>${(m.liquidity||0).toLocaleString()}</td><td>${(m.volume_24h||0).toLocaleString()}</td>`;
+    row.className = 'market-row';
+    const marketId = m.id || m.market_id || '';
+    row.innerHTML = `<td>${marketId}</td><td>${title}</td><td>${(m.liquidity||0).toLocaleString()}</td><td>${(m.volume_24h||0).toLocaleString()}</td>`;
+    row.addEventListener('click', () => {
+      window.ui.openPositionModal({
+        id: marketId,
+        title,
+        liquidity: m.liquidity,
+        volume_24h: m.volume_24h,
+      });
+    });
     list.appendChild(row);
   });
 }
@@ -132,7 +158,7 @@ async function loadResults() {
 
 async function loadSettings() {
   setLoading('settings-container', true);
-  const data = await apiGet('/api/polymarket/config');
+  const data = await apiGet('/api/polymarket/settings');
   setLoading('settings-container', false);
   
   const cfg = data.config || data.settings || data;
@@ -180,7 +206,7 @@ async function loadSettings() {
     confGroup.className = 'form-group';
     confGroup.innerHTML = `
       <label>Min Confidence Threshold</label>
-      <input type="number" id="setting-min-confidence" value="${cfg.min_confidence || 0.65}" min="0" max="1" step="0.05" />
+      <input type="number" id="setting-min-confidence" value="${(cfg.trading_controls && cfg.trading_controls.min_probability) || 0.65}" min="0" max="1" step="0.05" />
     `;
     form.appendChild(confGroup);
     
@@ -201,13 +227,17 @@ async function saveSettings() {
   const minConf = parseFloat(document.getElementById('setting-min-confidence').value);
   
   const payload = {
-    active_flux: activeFlux,
-    trade_frequency_hours: frequency,
-    min_confidence: minConf,
+    process: {
+      active_flux: activeFlux,
+      trade_frequency_hours: frequency,
+    },
+    trading_controls: {
+      min_probability: minConf,
+    },
   };
   
   try {
-    const data = await apiPost('/api/polymarket/config', payload);
+    const data = await apiPost('/api/polymarket/settings', payload);
     document.getElementById('settings-json').textContent = JSON.stringify(data.config || data, null, 2);
     alert('Settings saved successfully');
   } catch (err) {
@@ -234,19 +264,16 @@ async function stopFlux() {
 async function loadWorkforce() {
   setLoading('wf-status', true);
   setLoading('rss-cache', true);
-  setLoading('mcp-status', true);
   
-  const [status, rss, flux, fluxConfig, mcp] = await Promise.all([
+  const [status, rss, flux, fluxConfig] = await Promise.all([
     apiGet('/api/polymarket/workforce/status'),
     apiGet('/api/polymarket/rss/cache'),
     apiGet('/api/polymarket/flux/status'),
     apiGet('/api/polymarket/flux/config'),
-    apiGet('/api/polymarket/workforce/mcp'),
   ]);
   
   setLoading('wf-status', false);
   setLoading('rss-cache', false);
-  setLoading('mcp-status', false);
   
   // Workforce Status
   const wfEl = document.getElementById('wf-status');
@@ -327,35 +354,6 @@ async function loadWorkforce() {
     rssEl.innerHTML = '<div class="muted">No RSS cache available</div>';
   }
 
-  // MCP Status
-  const mcpEl = document.getElementById('mcp-status');
-  if (mcpEl) {
-    if (mcp && mcp.status === 'ok') {
-      const meta = mcp.mcp || {};
-      const nameInput = document.getElementById('mcp-name');
-      const hostInput = document.getElementById('mcp-host');
-      const portInput = document.getElementById('mcp-port');
-      if (nameInput && meta.name) nameInput.value = meta.name;
-      if (hostInput && meta.host) hostInput.value = meta.host;
-      if (portInput && meta.port) portInput.value = meta.port;
-      mcpEl.innerHTML = `
-        <div class="status-item">
-          <span class="label">Server:</span>
-          <span class="value">${mcp.started ? 'running' : 'stopped'}</span>
-        </div>
-        <div class="status-item">
-          <span class="label">Host:</span>
-          <span class="value">${meta.host || 'n/a'}</span>
-        </div>
-        <div class="status-item">
-          <span class="label">Port:</span>
-          <span class="value">${meta.port || 'n/a'}</span>
-        </div>
-      `;
-    } else {
-      mcpEl.innerHTML = '<div class="muted">MCP server not initialized</div>';
-    }
-  }
 }
 
 async function triggerWorkforce() {
@@ -363,7 +361,14 @@ async function triggerWorkforce() {
   if (btn) btn.disabled = true;
   
   setLoading('wf-trigger-result', true);
-  const res = await apiPost('/api/polymarket/flux/trigger-scan?verify_positions=false&start_if_stopped=true', {});
+  const triggerSelect = document.getElementById('trigger-type-select');
+  const triggerType = triggerSelect ? triggerSelect.value : 'manual';
+  const qs = new URLSearchParams({
+    verify_positions: 'false',
+    start_if_stopped: 'true',
+    trigger_type: triggerType,
+  }).toString();
+  const res = await apiPost(`/api/polymarket/flux/trigger-scan?${qs}`, {});
   setLoading('wf-trigger-result', false);
   
   const resultEl = document.getElementById('wf-trigger-result');
@@ -398,6 +403,9 @@ async function changeTriggerType() {
 
   try {
     await apiPost(`/api/polymarket/flux/config?${qs}`, {});
+    if (newType === 'interval') {
+      await apiPost('/api/polymarket/flux/start', {});
+    }
     await loadWorkforce();
   } catch (err) {
     showError('wf-status', 'Failed to change trigger type');
@@ -405,22 +413,7 @@ async function changeTriggerType() {
 }
 
 async function startMcp() {
-  const name = document.getElementById('mcp-name')?.value || 'CAMEL-Workforce';
-  const host = document.getElementById('mcp-host')?.value || 'localhost';
-  const port = document.getElementById('mcp-port')?.value || '8001';
-  const payload = {
-    name,
-    host,
-    port: parseInt(port, 10) || 8001,
-    start_server: true,
-  };
-  const res = await apiPost('/api/polymarket/workforce/mcp', payload);
-  if (res.status === 'ok') {
-    alert('MCP server initialized');
-    await loadWorkforce();
-  } else {
-    showError('mcp-status', res.message || 'Failed to start MCP server');
-  }
+  return;
 }
 
 async function exportResultsCSV() {
@@ -454,6 +447,71 @@ window.ui = {
   showError,
   loadOpenOrders,
   loadTrades,
+  openPositionModal: async (market) => {
+    const modal = document.getElementById('position-modal');
+    if (!modal) return;
+    document.getElementById('position-error').style.display = 'none';
+    document.getElementById('position-market-id').value = market.id || '';
+    document.getElementById('position-market-title').textContent = market.title || 'Market';
+    document.getElementById('position-quantity').value = '1';
+    document.getElementById('position-outcome').value = 'yes';
+    document.getElementById('position-price').value = '';
+    document.getElementById('position-market-meta').textContent = 'Loading market details...';
+    modal.style.display = 'flex';
+
+    try {
+      const details = await apiGet(`/api/polymarket/markets/${encodeURIComponent(market.id)}`);
+      if (details.status === 'success') {
+        const mid = details.mid_price ?? details.ask ?? details.bid ?? 0.5;
+        if (mid) {
+          document.getElementById('position-price').value = Number(mid).toFixed(3);
+        }
+        document.getElementById('position-market-meta').textContent =
+          `Bid: ${details.bid ?? 'n/a'} | Ask: ${details.ask ?? 'n/a'} | Mid: ${details.mid_price ?? 'n/a'}`;
+      } else {
+        document.getElementById('position-market-meta').textContent =
+          details.message || 'Market details unavailable';
+      }
+    } catch (err) {
+      document.getElementById('position-market-meta').textContent = 'Market details unavailable';
+    }
+  },
+  closePositionModal: () => {
+    const modal = document.getElementById('position-modal');
+    if (modal) modal.style.display = 'none';
+  },
+  submitPosition: async (event) => {
+    event.preventDefault();
+    const marketId = document.getElementById('position-market-id').value;
+    const outcome = document.getElementById('position-outcome').value;
+    const quantity = parseInt(document.getElementById('position-quantity').value || '0', 10);
+    const price = parseFloat(document.getElementById('position-price').value || '0');
+    const errEl = document.getElementById('position-error');
+    errEl.style.display = 'none';
+
+    if (!marketId || !quantity || !price) {
+      errEl.textContent = 'Market, shares, and price are required.';
+      errEl.style.display = 'block';
+      return;
+    }
+
+    const payload = {
+      market_id: marketId,
+      outcome,
+      quantity,
+      price,
+    };
+
+    const res = await apiPost('/api/polymarket/trades/execute', payload);
+    if (res && (res.status === 'filled' || res.success || res.trade_id)) {
+      alert(`Bet placed: ${res.trade_id || 'success'}`);
+      window.ui.closePositionModal();
+      await window.ui.loadDashboard();
+    } else {
+      errEl.textContent = res.detail || res.error || res.message || 'Failed to place bet.';
+      errEl.style.display = 'block';
+    }
+  },
   showAuthModal: () => {
     document.getElementById('auth-modal').style.display = 'flex';
   },
@@ -465,18 +523,29 @@ window.ui = {
     event.preventDefault();
     const apiKey = document.getElementById('auth-api-key').value;
     const walletAddr = document.getElementById('auth-wallet-input').value;
+    const privateKey = document.getElementById('auth-private-key')?.value;
+    const clobApiKey = document.getElementById('auth-clob-api-key')?.value;
+    const clobSecret = document.getElementById('auth-clob-secret')?.value;
+    const clobPassphrase = document.getElementById('auth-clob-passphrase')?.value;
     
     try {
       const payload = {};
       if (apiKey && apiKey.trim()) payload.api_key = apiKey.trim();
       if (walletAddr) payload.wallet_address = walletAddr;
+      if (privateKey && privateKey.trim()) payload.polygon_private_key = privateKey.trim();
+      if (clobApiKey && clobApiKey.trim()) payload.clob_api_key = clobApiKey.trim();
+      if (clobSecret && clobSecret.trim()) payload.clob_secret = clobSecret.trim();
+      if (clobPassphrase && clobPassphrase.trim()) payload.clob_passphrase = clobPassphrase.trim();
       
       const res = await apiPost('/api/polymarket/auth/login', payload);
       
+      if (res.session_token) {
+        localStorage.setItem('session_token', res.session_token);
+      }
       if (res.status === 'ok' || res.is_authenticated) {
         alert('Authenticated successfully!');
         window.ui.closeAuthModal();
-        window.location.reload();
+        await loadAuthStatus();
       } else {
         const errEl = document.getElementById('auth-error');
         errEl.textContent = res.message || 'Authentication failed';
@@ -489,6 +558,62 @@ window.ui = {
     }
   },
 };
+
+async function loadAuthStatus() {
+  const authButton = document.getElementById('auth-button');
+  const authStatus = document.getElementById('auth-status');
+  const authWallet = document.getElementById('auth-wallet');
+  if (!authButton && !authStatus) return;
+  const status = await apiGet('/api/polymarket/auth/status');
+  if (status.is_authenticated) {
+    const source = status.source || 'session';
+    if (authButton) {
+      authButton.textContent = source === 'env' ? 'Auth (env)' : 'Authenticated';
+      authButton.style.display = 'none';
+    }
+    if (authStatus) authStatus.textContent = 'Authenticated';
+    if (authWallet) {
+      if (status.wallet_address) {
+        authWallet.textContent = `${status.wallet_address.slice(0, 6)}...${status.wallet_address.slice(-4)}`;
+        authWallet.style.display = 'inline';
+        if (authStatus) authStatus.style.display = 'none';
+      } else {
+        authWallet.style.display = 'none';
+        if (authStatus) authStatus.style.display = 'inline';
+      }
+    }
+  } else if (status.env_configured) {
+    // Attempt auto-login using env defaults
+    const res = await apiPost('/api/polymarket/auth/login', {});
+    if (res.session_token) {
+      localStorage.setItem('session_token', res.session_token);
+      if (authButton) {
+        authButton.textContent = 'Auth (env)';
+        authButton.style.display = 'none';
+      }
+      if (authStatus) authStatus.textContent = 'Authenticated';
+      if (authWallet && res.wallet_address) {
+        authWallet.textContent = `${res.wallet_address.slice(0, 6)}...${res.wallet_address.slice(-4)}`;
+        authWallet.style.display = 'inline';
+        if (authStatus) authStatus.style.display = 'none';
+      }
+    } else {
+      if (authButton) {
+        authButton.textContent = 'Login';
+        authButton.style.display = 'inline-block';
+      }
+      if (authStatus) authStatus.textContent = 'Not Authenticated';
+      if (authWallet) authWallet.style.display = 'none';
+    }
+  } else {
+    if (authButton) {
+      authButton.textContent = 'Login';
+      authButton.style.display = 'inline-block';
+    }
+    if (authStatus) authStatus.textContent = 'Not Authenticated';
+    if (authWallet) authWallet.style.display = 'none';
+  }
+}
 
 async function loadClobSnapshot() {
   const statusEl = document.getElementById('clob-status');
@@ -588,6 +713,7 @@ async function loadTrades() {
 
 // Initialize event listeners when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
+  loadAuthStatus();
   // Dashboard buttons
   const btnSearchMarkets = document.getElementById('btn-search-markets');
   if (btnSearchMarkets) btnSearchMarkets.addEventListener('click', window.ui.loadMarkets);

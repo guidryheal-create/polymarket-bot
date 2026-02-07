@@ -17,10 +17,11 @@ from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
 # limitations : max trades per day, max active positions, min confidence, etc.
 
 from core.pipelines.polymarket_rss_flux import RSSFluxConfig, PolymarketRSSFlux
-from core.camel_runtime.societies import TradingWorkforceSociety
+from core.camel_runtime import CamelTradingRuntime
 from core.clients.polymarket_client import PolymarketClient
 from core.logging import log
 from api.services.polymarket.logging_service import logging_service
+from api.services.polymarket.config_service import process_config_service
 import asyncio
 
 router = APIRouter()
@@ -50,13 +51,22 @@ async def ensure_rss_flux() -> PolymarketRSSFlux:
     """Ensure RSS Flux instance is initialized for UI/API calls."""
     global _rss_flux_instance
     if _rss_flux_instance is None:
-        society = TradingWorkforceSociety()
-        workforce = await society.build()
+        runtime = await CamelTradingRuntime.instance()
+        workforce = await runtime.get_workforce()
+        trigger_cfg = process_config_service.get_workforce_config().trigger_config
+        trading_cfg = process_config_service.get_workforce_config().trading_controls
         _rss_flux_instance = PolymarketRSSFlux(
             workforce=workforce,
             api_client=PolymarketClient(),
-            config=RSSFluxConfig(),
+            config=RSSFluxConfig(
+                scan_interval=trigger_cfg.interval_hours * 3600,
+                trigger_type=trigger_cfg.trigger_type,
+                interval_hours=trigger_cfg.interval_hours,
+                max_trades_per_day=trading_cfg.max_trades_per_day,
+                min_confidence=trading_cfg.min_probability,
+            ),
         )
+        _rss_flux_instance._event_logger = logging_service.log_event
         log.info("[RSS FLUX API] Lazy-initialized RSS Flux instance")
     return _rss_flux_instance
 
@@ -143,6 +153,7 @@ async def trigger_manual_scan(
     background_tasks: BackgroundTasks,
     verify_positions: bool = Query(False),
     start_if_stopped: bool = Query(False),
+    trigger_type: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """Manually trigger a market batch processing cycle.
 
@@ -158,13 +169,14 @@ async def trigger_manual_scan(
     if not flux._running and start_if_stopped:
         # Start the flux in background if requested
         background_tasks.add_task(flux.start)
-    
+
     try:
+        effective_trigger = trigger_type or flux.config.trigger_type or "manual"
         # Trigger scan in background
         scan_id = f"manual_scan_{int(__import__('time').time())}"
         background_tasks.add_task(
             flux.process_market_batch,
-            trigger_type="manual",
+            trigger_type=effective_trigger,
             verify_positions=verify_positions,
         )
         
@@ -176,7 +188,7 @@ async def trigger_manual_scan(
         logging_service.log_event(
             "INFO",
             "RSS flux manual trigger",
-            {"scan_id": scan_id, "verify_positions": verify_positions},
+            {"scan_id": scan_id, "verify_positions": verify_positions, "trigger_type": effective_trigger},
         )
         
         return {
@@ -187,6 +199,7 @@ async def trigger_manual_scan(
                 "batch_size": flux.config.batch_size,
                 "review_threshold": flux.config.review_threshold,
                 "verify_positions": verify_positions,
+                "trigger_type": effective_trigger,
             },
         }
     except Exception as exc:
@@ -311,8 +324,16 @@ async def update_flux_config(
         flux.review_threshold = review_threshold
     if max_trades_per_day is not None:
         config.max_trades_per_day = max_trades_per_day
+        process_config_service.update_config({
+            "trading_controls": {"max_trades_per_day": max_trades_per_day}
+        })
     if min_confidence is not None:
         config.min_confidence = min_confidence
+        # Keep trading controls aligned with confidence threshold
+        if hasattr(process_config_service.get_workforce_config().trading_controls, "min_probability"):
+            process_config_service.update_config({
+                "trading_controls": {"min_probability": min_confidence}
+            })
     
     log.info(
         "[RSS FLUX API] Configuration updated: scan_interval=%s, batch_size=%s, "
@@ -322,6 +343,18 @@ async def update_flux_config(
         max_trades_per_day,
         min_confidence,
     )
+
+    # Persist trigger config changes for UI/settings
+    if trigger_type is not None or interval_hours is not None or interval_days is not None:
+        effective_interval_hours = interval_hours
+        if effective_interval_hours is None and interval_days is not None:
+            effective_interval_hours = interval_days * 24
+        payload: Dict[str, Any] = {"trigger_config": {}}
+        if trigger_type is not None:
+            payload["trigger_config"]["trigger_type"] = trigger_type
+        if effective_interval_hours is not None:
+            payload["trigger_config"]["interval_hours"] = effective_interval_hours
+        process_config_service.update_config(payload)
     
     return {
         "status": "updated",

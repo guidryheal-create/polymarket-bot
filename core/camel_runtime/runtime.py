@@ -116,6 +116,14 @@ class CamelTradingRuntime:
                 )
             return False
 
+    async def get_workforce(self) -> Any:
+        """Return the active Workforce instance, initializing if needed."""
+        if self._workforce is None:
+            await self.ensure_ready()
+        if self._workforce is None:
+            raise RuntimeError("Workforce is not available")
+        return self._workforce
+
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -387,6 +395,5 @@ class CamelTradingRuntime:
 
 # ✅ REMOVED: process_signal and run_task factory helpers
 # Use DailyProcess and other pipeline modules directly instead
-
 
 

@@ -1,6 +1,8 @@
 """Process configuration service for Polymarket API."""
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, Optional
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -12,10 +14,13 @@ from core.services.workforce_config_service import (
     WorkforceTriggerConfig,
     AgentWeightConfig,
 )
+from core.logging import log
+
+CONFIG_FILE_PATH = "config/polymarket_config.json"
 
 
 class ProcessConfigService:
-    """In-memory runtime configuration with validation hooks."""
+    """In-memory runtime configuration with validation hooks and JSON persistence."""
 
     def __init__(self) -> None:
         self._config_service = WorkforceConfigService()
@@ -24,6 +29,28 @@ class ProcessConfigService:
         self._max_ai_weighted_daily = 1.0
         self._max_ai_weighted_per_trade = 1.0
         self._last_updated = datetime.now(timezone.utc).isoformat()
+        self._load_config_from_file()
+
+    def _load_config_from_file(self):
+        """Loads configuration from the JSON file if it exists."""
+        if os.path.exists(CONFIG_FILE_PATH):
+            try:
+                with open(CONFIG_FILE_PATH, "r") as f:
+                    config = json.load(f)
+                    self.update_config(config)
+                    log.info(f"Loaded configuration from {CONFIG_FILE_PATH}")
+            except (json.JSONDecodeError, IOError) as e:
+                log.error(f"Error loading configuration from {CONFIG_FILE_PATH}: {e}")
+
+    def _save_config_to_file(self):
+        """Saves the current configuration to the JSON file."""
+        try:
+            os.makedirs(os.path.dirname(CONFIG_FILE_PATH), exist_ok=True)
+            with open(CONFIG_FILE_PATH, "w") as f:
+                json.dump(self.get_config(), f, indent=4)
+            log.info(f"Saved configuration to {CONFIG_FILE_PATH}")
+        except IOError as e:
+            log.error(f"Error saving configuration to {CONFIG_FILE_PATH}: {e}")
 
     def get_config(self) -> Dict[str, Any]:
         return {
@@ -40,10 +67,10 @@ class ProcessConfigService:
         }
 
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        process = payload.get("process") or {}
-        trading_controls = payload.get("trading_controls") or {}
-        trigger_config = payload.get("trigger_config") or {}
-        agent_weights = payload.get("agent_weights") or {}
+        process = payload.get("process", {})
+        trading_controls = payload.get("trading_controls", {})
+        trigger_config = payload.get("trigger_config", {})
+        agent_weights = payload.get("agent_weights", {})
 
         if "active_flux" in process:
             self._active_flux = str(process["active_flux"])
@@ -75,6 +102,7 @@ class ProcessConfigService:
         self._config_service.agent_weights.validate()
 
         self._last_updated = datetime.now(timezone.utc).isoformat()
+        self._save_config_to_file()  # Persist changes
         return self.get_config()
 
     def get_workforce_config(self) -> WorkforceConfigService:

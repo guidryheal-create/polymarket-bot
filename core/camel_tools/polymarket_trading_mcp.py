@@ -141,8 +141,22 @@ class PolymarketTradingToolkit:
                 market_id = m.get("id")
                 if market_id not in unique_markets:
                     unique_markets[market_id] = m
-            
-            markets = list(unique_markets.values())[:limit]
+            def _is_crypto(m: Dict[str, Any]) -> bool:
+                cat = str(m.get("category", "")).lower()
+                if "crypto" in cat:
+                    return True
+                tags = m.get("tags") or []
+                if isinstance(tags, str):
+                    tags = [tags]
+                for t in tags:
+                    if "crypto" in str(t).lower():
+                        return True
+                return False
+
+            markets = [m for m in unique_markets.values() if _is_crypto(m)]
+            if not markets:
+                markets = list(unique_markets.values())
+            markets = markets[:limit]
             
             result_data = {
                 "query": query,

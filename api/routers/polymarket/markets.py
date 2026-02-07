@@ -30,7 +30,12 @@ async def get_trending_markets(hours: int = Query(24, ge=1, le=168)):
 
 
 @router.get("/markets/search")
-async def search_markets(q: str = Query(..., min_length=1), limit: int = Query(20, ge=1, le=100)):
+async def search_markets(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    active_only: bool = Query(False),
+    category: str | None = Query(None),
+):
     """
     Search Polymarket markets by keyword
     
@@ -41,8 +46,18 @@ async def search_markets(q: str = Query(..., min_length=1), limit: int = Query(2
     Returns:
         List of matching markets
     """
-    result = service.search_markets(query=q, limit=limit, offset=0)
-    logging_service.log_event("INFO", "Searched markets", {"query": q, "limit": limit})
+    result = service.search_markets(
+        query=q,
+        limit=limit,
+        offset=0,
+        active_only=active_only,
+        category=category,
+    )
+    logging_service.log_event(
+        "INFO",
+        "Searched markets",
+        {"query": q, "limit": limit, "category": category},
+    )
     return result
 
 

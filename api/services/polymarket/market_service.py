@@ -29,13 +29,50 @@ class PolymarketService:
         self,
         query: str,
         limit: int = 20,
-        offset: int = 0
+        offset: int = 0,
+        active_only: bool = True,
+        category: str | None = None,
     ) -> Dict[str, Any]:
         """Search for markets."""
         log.info(f"[POLYMARKET SERVICE] Searching markets: query={query}, limit={limit}")
         result = self.toolkit.search_markets(query=query, limit=limit, offset=offset)
         
         if result.get("success"):
+            markets = result.get("markets", [])
+            if category and isinstance(markets, list):
+                needle = category.strip().lower()
+                def _matches_category(m: Dict[str, Any]) -> bool:
+                    cat = str(m.get("category", "")).lower()
+                    if needle and needle in cat:
+                        return True
+                    tags = m.get("tags") or []
+                    if isinstance(tags, str):
+                        tags = [tags]
+                    for t in tags:
+                        if needle in str(t).lower():
+                            return True
+                    return False
+                markets = [m for m in markets if _matches_category(m)]
+                result["markets"] = markets
+                result["count"] = len(markets)
+            if active_only and isinstance(markets, list):
+                def _is_active(m: Dict[str, Any]) -> bool:
+                    if m.get("active") is False or m.get("closed") is True:
+                        return False
+                    close_time = m.get("close_time") or m.get("end_time")
+                    if isinstance(close_time, str):
+                        try:
+                            close_dt = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                            if close_dt <= datetime.now(close_dt.tzinfo):
+                                return False
+                        except Exception:
+                            pass
+                    return True
+                active_markets = [m for m in markets if _is_active(m)]
+                if active_markets:
+                    markets = active_markets
+                    result["markets"] = markets
+                    result["count"] = len(markets)
             log.debug(f"[POLYMARKET SERVICE] Found {result.get('count', 0)} markets")
         else:
             log.warning(f"[POLYMARKET SERVICE] Search failed: {result.get('error')}")

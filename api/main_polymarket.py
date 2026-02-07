@@ -8,6 +8,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import logging
 from api.middleware.session import SessionAuthMiddleware
+from core.camel_runtime import CamelTradingRuntime
+from api.services.polymarket.config_service import process_config_service
+from api.routers.polymarket.rss_flux import ensure_rss_flux
 
 # Import routers
 from api.routers.polymarket import (
@@ -39,6 +42,25 @@ app = FastAPI(
     description="Agentic trading system for Polymarket prediction markets",
     version="0.1.0",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Application startup event.
+    Initializes the CamelTradingRuntime.
+    """
+    logger.info("Application startup: Initializing CamelTradingRuntime...")
+    await CamelTradingRuntime.instance()
+    logger.info("CamelTradingRuntime initialized.")
+    try:
+        config = process_config_service.get_config()
+        if config.get("active_flux") == "polymarket_rss_flux":
+            flux = await ensure_rss_flux()
+            if flux.trigger_type == "interval" and not flux._running:
+                await flux.start()
+                logger.info("RSS Flux started on startup (interval trigger).")
+    except Exception as exc:
+        logger.warning("RSS Flux startup init failed: %s", exc)
 
 # Static assets for Jinja UI
 app.mount("/static", StaticFiles(directory="frontend/static"), name="static")

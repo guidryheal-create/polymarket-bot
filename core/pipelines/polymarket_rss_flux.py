@@ -120,6 +120,7 @@ class PolymarketRSSFlux:
         self._last_trigger_at: Optional[datetime] = None
         self._last_trigger_type: Optional[str] = None
         self._last_interval_trigger_at: Optional[datetime] = None
+        self._event_logger = None
         self._load_cache()
 
     def _load_cache(self) -> None:
@@ -324,6 +325,15 @@ class PolymarketRSSFlux:
             }
 
         async with self._scan_lock:
+            if callable(self._event_logger):
+                try:
+                    self._event_logger(
+                        "INFO",
+                        "RSS flux scan started",
+                        {"trigger_type": trigger_type},
+                    )
+                except Exception:
+                    pass
             self._last_trigger_at = now
             self._last_trigger_type = trigger_type
             if trigger_type == "interval":
@@ -417,11 +427,36 @@ class PolymarketRSSFlux:
                     summary["opportunities_filtered"],
                     summary["trades_executed"],
                 )
+                if callable(self._event_logger):
+                    try:
+                        self._event_logger(
+                            "INFO",
+                            "RSS flux scan completed",
+                            {
+                                "batch_id": batch_id,
+                                "trigger_type": trigger_type,
+                                "markets_scanned": summary.get("markets_scanned"),
+                                "opportunities_filtered": summary.get("opportunities_filtered"),
+                                "trades_executed": summary.get("trades_executed"),
+                                "pending_review": summary.get("pending_review"),
+                            },
+                        )
+                    except Exception:
+                        pass
 
                 return summary
 
             except Exception as exc:
                 log.error(f"[POLYMARKET RSS FLUX] Batch processing failed: %s", exc, exc_info=True)
+                if callable(self._event_logger):
+                    try:
+                        self._event_logger(
+                            "ERROR",
+                            "RSS flux scan failed",
+                            {"batch_id": batch_id, "error": str(exc), "trigger_type": trigger_type},
+                        )
+                    except Exception:
+                        pass
                 return {
                     "batch_id": batch_id,
                     "error": str(exc),

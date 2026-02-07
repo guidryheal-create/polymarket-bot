@@ -28,18 +28,18 @@
         <a href="/ui/chat">Chat</a>
       </nav>
       <div class="auth-status">
-        {% if is_authenticated and wallet_address %}
-        <div class="connected">
+        <div class="{% if is_authenticated %}connected{% else %}disconnected{% endif %}">
           <span class="dot"></span>
-          <span id="auth-wallet">{{ wallet_address[:6] }}...{{ wallet_address[-4:] }}</span>
+          <span id="auth-wallet" style="display: {% if is_authenticated and wallet_address %}inline{% else %}none{% endif %};">
+            {% if wallet_address %}{{ wallet_address[:6] }}...{{ wallet_address[-4:] }}{% endif %}
+          </span>
+          <span id="auth-status" style="display: {% if is_authenticated and wallet_address %}none{% else %}inline{% endif %};">
+            {% if is_authenticated %}Authenticated{% else %}Not Authenticated{% endif %}
+          </span>
+          <button id="auth-button" onclick="window.ui.showAuthModal()" style="margin-left: 10px; padding: 6px 12px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem;">
+            {% if is_authenticated %}Auth{% else %}Login{% endif %}
+          </button>
         </div>
-        {% else %}
-        <div class="disconnected">
-          <span class="dot"></span>
-          <span id="auth-status">Not Authenticated</span>
-          <button id="auth-button" onclick="window.ui.showAuthModal()" style="margin-left: 10px; padding: 6px 12px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem;">Login</button>
-        </div>
-        {% endif %}
       </div>
     </header>
     <main>
@@ -62,6 +62,22 @@
           <div style="display: flex; flex-direction: column; gap: 6px;">
             <label for="auth-wallet">Wallet Address (optional)</label>
             <input type="text" id="auth-wallet-input" placeholder="0x..." style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <label for="auth-private-key">Polygon Private Key (optional)</label>
+            <input type="password" id="auth-private-key" placeholder="POLYGON_PRIVATE_KEY" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <label for="auth-clob-api-key">CLOB API Key (optional)</label>
+            <input type="password" id="auth-clob-api-key" placeholder="CLOB_API_KEY" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <label for="auth-clob-secret">CLOB Secret (optional)</label>
+            <input type="password" id="auth-clob-secret" placeholder="CLOB_SECRET" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <label for="auth-clob-passphrase">CLOB Passphrase (optional)</label>
+            <input type="password" id="auth-clob-passphrase" placeholder="CLOB_PASS_PHRASE" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px;" />
           </div>
           <div style="display: flex; gap: 8px;">
             <button type="submit" style="flex: 1; padding: 10px; background: #0066cc; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500;">Login</button>

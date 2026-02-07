@@ -9,16 +9,17 @@ from typing import Any, Dict, List, Literal, Optional, Union, TYPE_CHECKING
 from pydantic import Field, ConfigDict, model_validator, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # Load environment variables from .env file if it exists (for Windows debugging)
 try:
     from dotenv import load_dotenv
-    project_root = Path(__file__).resolve().parents[1]
-    env_file = project_root / "env"
+    env_file = Path(".env")
     if env_file.exists():
         load_dotenv(env_file, override=False)  # Don't override existing env vars
     else:
         # Fallback to .env in project root
-        load_dotenv(project_root / ".env", override=False)
+        load_dotenv(PROJECT_ROOT / ".env", override=False)
 except ImportError:
     # python-dotenv not installed, pydantic-settings will handle env vars
     pass
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         extra="ignore",
         env_ignore_empty=True,
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
     )
     
     # API Configuration

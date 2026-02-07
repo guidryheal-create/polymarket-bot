@@ -104,6 +104,10 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         # Prefer custom header
         token = request.headers.get("X-Session-Token")
         if not token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header.split(" ", 1)[1].strip()
+        if not token:
             # Fallback to cookie named 'session_token'
             token = request.cookies.get("session_token")
 

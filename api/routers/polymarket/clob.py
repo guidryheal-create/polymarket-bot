@@ -9,10 +9,15 @@ client = PolymarketClient()
 
 
 def _require_auth():
+    client.refresh_from_env()
     if not client.is_authenticated:
+        diag = client.auth_diagnostics()
         raise HTTPException(
             status_code=400,
-            detail="Polymarket client not authenticated. Set POLYGON_PRIVATE_KEY/PK and API creds.",
+            detail={
+                "message": "Polymarket client not authenticated. Set POLYGON_PRIVATE_KEY/PK and CLOB creds.",
+                "diagnostics": diag,
+            },
         )
 
 

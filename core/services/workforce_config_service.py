@@ -217,7 +217,6 @@ class WorkforceConfigService:
     # =========================================================================
     # TRADE VALIDATION & LIMITS
     # =========================================================================
-    
     def should_allow_trade(
         self,
         market_data: Dict[str, Any],

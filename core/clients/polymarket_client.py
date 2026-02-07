@@ -12,12 +12,14 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 import os
 import httpx
+import json
 from core.logging import log
 from core.config import settings
+from tests.test_api_main import client
 
 # Public API URLs (no auth required)
-GAMMA_API_URL = "https://gamma-api.polymarket.com"
-CLOB_API_URL = "https://clob.polymarket.com"
+GAMMA_API_URL = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com")
+CLOB_API_URL = os.getenv("CLOB_API_URL", "https://clob.polymarket.com")
 
 # Try to import py-clob-client for authenticated trading
 try:
@@ -82,7 +84,7 @@ class PolymarketClient:
         self.polygon_address = polygon_address or settings.polygon_address
         self.chain_id = chain_id or settings.polymarket_chain_id
         
-        self.host = host or os.getenv("CLOB_API_URL") or "https://clob.polymarket.com"
+        self.host = host or os.getenv("CLOB_API_URL") or CLOB_API_URL
         self._api_creds = self._load_api_creds()
         
         # Initialize authenticated CLOB client if credentials provided
@@ -94,14 +96,37 @@ class PolymarketClient:
                     "CLOB client not available: py-clob-client not installed or missing credentials. "
                     "Falling back to public API mode."
                 )
+
+    def refresh_from_env(self) -> None:
+        """Reload credentials from environment and (re)initialize CLOB client."""
+        print(settings.polygon_private_key)
+        self.private_key = os.getenv("POLYGON_PRIVATE_KEY", settings.polygon_private_key)
+        self.polygon_address = os.getenv("POLYGON_ADDRESS", settings.polygon_address) 
+        self.chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", settings.polymarket_chain_id) or 137)
+        self.host = os.getenv("CLOB_API_URL") or self.host or CLOB_API_URL
+        self._api_creds = self._load_api_creds()
+        if self.private_key and CLOB_CLIENT_AVAILABLE:
+            self._init_clob_client()
+
+    def auth_diagnostics(self) -> Dict[str, Any]:
+        """Return diagnostic info for auth readiness."""
+        return {
+            "clob_client_available": CLOB_CLIENT_AVAILABLE,
+            "has_private_key": bool(self.private_key),
+            "has_polygon_address": bool(self.polygon_address),
+            "has_api_creds": bool(self._api_creds),
+            "chain_id": self.chain_id,
+            "host": self.host,
+            "is_authenticated": self.is_authenticated,
+        }
     
     def _load_api_creds(self) -> Optional[Any]:
         """Load API credentials from environment if available."""
         if not CLOB_CLIENT_AVAILABLE or ApiCreds is None:
             return None
-        api_key = os.getenv("CLOB_API_KEY")
-        api_secret = os.getenv("CLOB_SECRET")
-        api_passphrase = os.getenv("CLOB_PASS_PHRASE")
+        api_key = os.getenv("POLYMARKET_API_KEY")
+        api_secret = os.getenv("POLYMARKET_API_SECRET")
+        api_passphrase = os.getenv("POLYMARKET_PASSPHRASE")
         if api_key and api_secret and api_passphrase:
             return ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
         return None
@@ -112,7 +137,7 @@ class PolymarketClient:
             if not CLOB_CLIENT_AVAILABLE:
                 log.warning("py-clob-client not available. Install with: pip install py-clob-client")
                 return
-            
+
             # Create CLOB client with wallet credentials (py-clob-client examples methodology)
             self._clob_client = ClobClient(
                 host=self.host,
@@ -168,7 +193,8 @@ class PolymarketClient:
         self,
         market_id: Optional[str] = None,
         condition_id: Optional[str] = None,
-        slug: Optional[str] = None
+        slug: Optional[str] = None,
+        market_maker_address: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Get complete market information.
         
@@ -176,17 +202,27 @@ class PolymarketClient:
             market_id: Market ID
             condition_id: Condition ID (alternative identifier)
             slug: Market slug (alternative identifier)
+            market_maker_address: Market maker address (alternative identifier)
         
         Returns:
             Full market object with all metadata
         """
         try:
             # Determine which identifier to use
-            if slug:
+            if market_maker_address:
+                data = await self._fetch_gamma_api("/markets", {"marketMakerAddress": market_maker_address})
+            elif slug:
+                data = await self._fetch_gamma_api("/markets", {"slug": slug})
+                if isinstance(data, list) and len(data) > 0:
+                    return data[0]
                 data = await self._fetch_gamma_api(f"/markets/{slug}")
             elif condition_id:
                 data = await self._fetch_gamma_api("/markets", {"condition_id": condition_id})
             elif market_id:
+                if isinstance(market_id, str) and market_id.startswith("0x") and len(market_id) == 42:
+                    data = await self._fetch_gamma_api("/markets", {"marketMakerAddress": market_id})
+                    if isinstance(data, list) and len(data) > 0:
+                        return data[0]
                 data = await self._fetch_gamma_api(f"/markets/{market_id}")
             else:
                 raise ValueError("One of market_id, condition_id, or slug must be provided")
@@ -199,62 +235,39 @@ class PolymarketClient:
         except Exception as e:
             log.error(f"Failed to get market details: {e}")
             raise
-    
+
     async def search_markets(
         self,
         query: str = "",
         limit: int = 20,
-        filters: Optional[Dict[str, Any]] = None
+        page: int = 1,
+        active_only: bool = True,
+        sort: str = "volume_24hr",
     ) -> List[Dict[str, Any]]:
-        """Search markets by text query, slug, or keywords.
-        
-        Args:
-            query: Search query (market title, slug, or keywords)
-            limit: Maximum number of results (default 20)
-            filters: Optional filters (active, closed, tags, etc.)
-        
-        Returns:
-            List of markets matching the query
+        """
+        Search active Polymarket markets using the Gamma public search API.
+
+        Server-side filtering & sorting to minimize payload size.
         """
         try:
-            params = {"query": query} if query else {}
-            
-            if filters:
-                params.update(filters)
-            
-            if limit:
-                params["limit"] = limit
-            
-            data = await self._fetch_gamma_api("/markets", params)
-            
-            # Handle different response formats
-            if isinstance(data, list):
-                results = data
-            elif isinstance(data, dict):
-                if "data" in data:
-                    results = data["data"]
-                else:
-                    results = [data]
-            else:
-                results = []
+            params = {
+                "q": query,
+                "page": page,
+                "limit_per_type": limit,
+                "type": "events",
+                "sort": sort,
+                "presets": ["EventsTitle", "Events"],
+            }
 
-            if query:
-                needle = query.lower().strip()
-                def _match(m: Dict[str, Any]) -> bool:
-                    hay = " ".join([
-                        str(m.get("title", "")),
-                        str(m.get("question", "")),
-                        str(m.get("name", "")),
-                        str(m.get("slug", "")),
-                        str(m.get("category", "")),
-                    ]).lower()
-                    return needle in hay
-                results = [m for m in results if _match(m)]
+            if active_only:
+                params["events_status"] = "active"
 
-            return results[:limit] if limit else results
-            
+            data = await self._fetch_gamma_api("/public-search", params)
+
+            return data["events"]
+
         except Exception as e:
-            log.error(f"Failed to search markets: {e}")
+            log.error(f"Gamma market search failed: {e}")
             raise
     
     async def get_event_markets(
@@ -295,7 +308,7 @@ class PolymarketClient:
     
     async def filter_markets_by_category(
         self,
-        category: str,
+        category: str = "crypto",
         active_only: bool = True,
         limit: int = 20
     ) -> List[Dict[str, Any]]:
@@ -375,17 +388,11 @@ class PolymarketClient:
         timeframe: str = "24h",
         limit: int = 20
     ) -> List[Dict[str, Any]]:
+        # correct timeframe schema
+        # correct limit schema
         """Get trending markets by sorting on volume."""
-        markets = await self.search_markets(query="", limit=max(1, min(limit, 100)))
-        def volume_key(m: Dict[str, Any]) -> float:
-            vol = m.get("volume_24h")
-            if vol is None:
-                vol = m.get("volume", {}).get("sum", 0) if isinstance(m.get("volume"), dict) else m.get("volume", 0)
-            try:
-                return float(vol or 0)
-            except Exception:
-                return 0.0
-        markets.sort(key=volume_key, reverse=True)
+        markets = await self._clob_client.get_markets("_c=15M&_s=volume_24hr&_sts=active&_l=4&_offset=0")
+        
         return markets[:limit]
 
     async def get_closing_soon_markets(
@@ -394,8 +401,9 @@ class PolymarketClient:
         limit: int = 20
     ) -> List[Dict[str, Any]]:
         """Get markets closing within the next N hours."""
-        markets = await self.search_markets(query="", limit=max(1, min(limit, 200)))
+        markets = await self._clob_client.get_markets("_c=15M&_s=volume_24hr&_sts=active&_l=4&_offset=0")
         now = datetime.utcnow()
+        # maybe not close time and etc
         closing = []
         for m in markets:
             close_time = m.get("close_time") or m.get("closing_time") or m.get("end_time")
@@ -413,9 +421,8 @@ class PolymarketClient:
                 closing.append(m)
         return closing[:limit]
 
-    async def get_outcome_token_ids(self, market_id: str) -> Dict[str, str]:
-        """Get YES/NO token IDs for a market."""
-        details = await self.get_market_details(market_id=market_id)
+    def extract_outcome_token_ids(self, details: Dict[str, Any]) -> Dict[str, str]:
+        """Extract YES/NO token IDs from a market details payload."""
         tokens = details.get("tokens", []) if isinstance(details, dict) else []
         outcome_map: Dict[str, str] = {}
         for token in tokens:
@@ -423,10 +430,38 @@ class PolymarketClient:
             token_id = token.get("token_id")
             if outcome in ("YES", "NO") and token_id:
                 outcome_map[outcome] = str(token_id)
+        if not outcome_map and isinstance(details, dict):
+            clob_token_ids = details.get("clobTokenIds") or details.get("clob_token_ids")
+            outcomes = details.get("outcomes")
+            try:
+                if isinstance(clob_token_ids, str):
+                    clob_token_ids = json.loads(clob_token_ids)
+                if isinstance(outcomes, str):
+                    outcomes = json.loads(outcomes)
+            except Exception:
+                pass
+            if isinstance(clob_token_ids, list) and isinstance(outcomes, list):
+                for outcome, token_id in zip(outcomes, clob_token_ids):
+                    outcome_map[str(outcome).upper()] = str(token_id)
         if not outcome_map and isinstance(details, dict) and details.get("clob_token_id"):
-            # Fallback for older API responses
             outcome_map["YES"] = str(details["clob_token_id"])
         return outcome_map
+
+    async def get_outcome_token_ids(
+        self,
+        market_id: Optional[str] = None,
+        condition_id: Optional[str] = None,
+        slug: Optional[str] = None,
+        market_maker_address: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Get YES/NO token IDs for a market."""
+        details = await self.get_market_details(
+            market_id=market_id,
+            condition_id=condition_id,
+            slug=slug,
+            market_maker_address=market_maker_address,
+        )
+        return self.extract_outcome_token_ids(details)
     
     # ========================================
     # Authenticated Trading Methods (requires CLOB client)
@@ -476,7 +511,7 @@ class PolymarketClient:
 
             if OrderArgs is None or OrderType is None:
                 raise RuntimeError("py-clob-client is not available for order placement.")
-
+            # manage error and check format ? maybe a check if possible 
             expiration_value = expiration or os.getenv("CLOB_ORDER_EXPIRATION") or "1000000000000"
             order_args = OrderArgs(
                 price=price,
@@ -507,7 +542,7 @@ class PolymarketClient:
             raise RuntimeError("Not authenticated.")
         
         try:
-            result = self._clob_client.cancel_order(order_id)
+            result = self._clob_client.cancel(order_id)
             log.info(f"Order cancelled: {order_id}")
             return result
         except Exception as e:
@@ -543,13 +578,18 @@ class PolymarketClient:
             raise RuntimeError("py-clob-client OpenOrderParams unavailable.")
 
         try:
-            params = OpenOrderParams(
-                market=market,
-                maker_address=maker_address or self._clob_client.get_address(),
-            )
-            orders = self._clob_client.get_orders(params)
-            log.debug(f"Retrieved {len(orders)} open orders (filtered)")
-            return orders
+            if maker_address is None:
+                params = OpenOrderParams(
+                    market=market,
+                    # taker=maker_address or self._clob_client.get_address(),
+                )
+                orders = self._clob_client.get_orders(params)
+                log.debug(f"Retrieved {len(orders)} open orders (filtered)")
+                return orders
+            else :
+                params = TradeParams(market=market, maker_address=maker_address)
+                trades = self._clob_client.get_trades(params)
+                return trades
         except Exception as e:
             log.error(f"Failed to get open orders: {e}")
             raise
@@ -569,7 +609,6 @@ class PolymarketClient:
         try:
             params = TradeParams(
                 maker_address=maker_address or self._clob_client.get_address(),
-                taker_address=taker_address,
                 market=market,
             )
             trades = self._clob_client.get_trades(params)
@@ -648,11 +687,8 @@ class PolymarketClient:
             if self.is_authenticated:
                 orders = self._clob_client.get_orders()
             else:
-                host = self.host or os.getenv("CLOB_API_URL", "https://clob.polymarket.com")
-                address = self.polygon_address or os.getenv(
-                    "POLY_ADDRESS",
-                    "0xc68576124eC1fF645F81a560E14003C8deF2e8fb",
-                )
+                host = self.host or os.getenv("CLOB_API_URL", CLOB_API_URL)
+                address = self.polygon_address or os.getenv("POLYGON_ADDRESS") or settings.polygon_address
                 readonly_api_key = os.getenv("CLOB_READONLY_API_KEY")
                 if not readonly_api_key or not address:
                     log.warning(
